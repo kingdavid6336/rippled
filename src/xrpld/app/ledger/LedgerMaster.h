@@ -1,0 +1,422 @@
+#pragma once
+
+#include <xrpld/app/ledger/AbstractFetchPackContainer.h>
+#include <xrpld/app/ledger/InboundLedger.h>
+#include <xrpld/app/ledger/LedgerHistory.h>
+#include <xrpld/app/ledger/LedgerHolder.h>
+#include <xrpld/app/ledger/LedgerReplay.h>
+#include <xrpld/app/main/Application.h>
+#include <xrpld/core/TimeKeeper.h>
+
+#include <xrpl/basics/Blob.h>
+#include <xrpl/basics/RangeSet.h>
+#include <xrpl/basics/UptimeClock.h>
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/basics/chrono.h>
+#include <xrpl/beast/insight/Collector.h>
+#include <xrpl/beast/insight/Gauge.h>
+#include <xrpl/beast/insight/Hook.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/ledger/CanonicalTXSet.h>
+#include <xrpl/ledger/Ledger.h>
+#include <xrpl/ledger/ReadView.h>
+#include <xrpl/protocol/Protocol.h>
+#include <xrpl/protocol/RippleLedgerHash.h>
+#include <xrpl/protocol/Rules.h>
+
+#include <xrpl.pb.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace xrpl {
+
+class Peer;
+class Transaction;
+
+// Tracks the current ledger and any ledgers in the process of closing
+// Tracks ledger history
+// Tracks held transactions
+class LedgerMaster : public AbstractFetchPackContainer
+{
+public:
+    explicit LedgerMaster(
+        Application& app,
+        Stopwatch& stopwatch,
+        beast::insight::Collector::ptr const& collector,
+        beast::Journal journal);
+
+    ~LedgerMaster() override = default;
+
+    LedgerIndex
+    getCurrentLedgerIndex();
+    LedgerIndex
+    getValidLedgerIndex();
+
+    bool
+    isCompatible(ReadView const&, beast::Journal::Stream, char const* reason);
+
+    std::recursive_mutex&
+    peekMutex();
+
+    // The current ledger is the ledger we believe new transactions should go in
+    std::shared_ptr<ReadView const>
+    getCurrentLedger();
+
+    // The finalized ledger is the last closed/accepted ledger
+    std::shared_ptr<Ledger const>
+    getClosedLedger()
+    {
+        return closedLedger_.get();
+    }
+
+    // The validated ledger is the last fully validated ledger.
+    std::shared_ptr<Ledger const>
+    getValidatedLedger();
+
+    // The Rules are in the last fully validated ledger if there is one.
+    Rules
+    getValidatedRules();
+
+    // This is the last ledger we published to clients and can lag the validated
+    // ledger
+    std::shared_ptr<ReadView const>
+    getPublishedLedger();
+
+    std::chrono::seconds
+    getPublishedLedgerAge();
+    std::chrono::seconds
+    getValidatedLedgerAge();
+    bool
+    isCaughtUp(std::string& reason);
+
+    std::uint32_t
+    getEarliestFetch();
+
+    bool
+    storeLedger(std::shared_ptr<Ledger const> ledger);
+
+    void
+    setFullLedger(std::shared_ptr<Ledger const> const& ledger, bool isSynchronous, bool isCurrent);
+
+    /**
+     * Check the sequence number and parent close time of a
+     * ledger against our clock and last validated ledger to
+     * see if it can be the network's current ledger
+     */
+    bool
+    canBeCurrent(std::shared_ptr<Ledger const> const& ledger);
+
+    void
+    switchLCL(std::shared_ptr<Ledger const> const& lastClosed);
+
+    void
+    failedSave(std::uint32_t seq, uint256 const& hash);
+
+    std::string
+    getCompleteLedgers();
+
+    /**
+     * Apply held transactions to the open ledger
+     * This is normally called as we close the ledger.
+     * The open ledger remains open to handle new transactions
+     * until a new open ledger is built.
+     */
+    void
+    applyHeldTransactions();
+
+    /**
+     * Get the next transaction held for a particular account if any.
+     * This is normally called when a transaction for that account is
+     * successfully applied to the open ledger so the next transaction
+     * can be resubmitted without waiting for ledger close.
+     */
+    std::shared_ptr<STTx const>
+    popAcctTransaction(std::shared_ptr<STTx const> const& tx);
+
+    /**
+     * Get a ledger's hash by sequence number using the cache
+     */
+    uint256
+    getHashBySeq(std::uint32_t index);
+
+    /**
+     * Walk to a ledger's hash using the skip list
+     */
+    std::optional<LedgerHash>
+    walkHashBySeq(std::uint32_t index, InboundLedger::Reason reason);
+
+    /**
+     * Walk the chain of ledger hashes to determine the hash of the
+     * ledger with the specified index. The referenceLedger is used as
+     * the base of the chain and should be fully validated and must not
+     * precede the target index. This function may throw if nodes
+     * from the reference ledger or any prior ledger are not present
+     * in the node store.
+     */
+    std::optional<LedgerHash>
+    walkHashBySeq(
+        std::uint32_t index,
+        std::shared_ptr<ReadView const> const& referenceLedger,
+        InboundLedger::Reason reason);
+
+    std::shared_ptr<Ledger const>
+    getLedgerBySeq(std::uint32_t index);
+
+    std::shared_ptr<Ledger const>
+    getLedgerByHash(uint256 const& hash);
+
+    void
+    setLedgerRangePresent(std::uint32_t minV, std::uint32_t maxV);
+
+    std::optional<NetClock::time_point>
+    getCloseTimeBySeq(LedgerIndex ledgerIndex);
+
+    std::optional<NetClock::time_point>
+    getCloseTimeByHash(LedgerHash const& ledgerHash, LedgerIndex ledgerIndex);
+
+    void
+    addHeldTransaction(std::shared_ptr<Transaction> const& trans);
+    void
+    fixMismatch(ReadView const& ledger);
+
+    bool
+    haveLedger(std::uint32_t seq);
+    void
+    clearLedger(std::uint32_t seq);
+    bool
+    isValidated(ReadView const& ledger);
+    bool
+    getValidatedRange(std::uint32_t& minVal, std::uint32_t& maxVal);
+    bool
+    getFullValidatedRange(std::uint32_t& minVal, std::uint32_t& maxVal);
+
+    void
+    sweep();
+    float
+    getCacheHitRate();
+
+    void
+    checkAccept(std::shared_ptr<Ledger const> const& ledger);
+    void
+    checkAccept(uint256 const& hash, std::uint32_t seq);
+    void
+    consensusBuilt(
+        std::shared_ptr<Ledger const> const& ledger,
+        uint256 const& consensusHash,
+        json::Value consensus);
+
+    void
+    setBuildingLedger(LedgerIndex index);
+
+    void
+    tryAdvance();
+    bool
+    newPathRequest();  // Returns true if path request successfully placed.
+    bool
+    isNewPathRequest();
+    bool
+    newOrderBookDB();  // Returns true if able to fulfill request.
+
+    bool
+    fixIndex(LedgerIndex ledgerIndex, LedgerHash const& ledgerHash);
+
+    void
+    clearPriorLedgers(LedgerIndex seq);
+
+    void
+    clearLedgerCachePrior(LedgerIndex seq);
+
+    // ledger replay
+    void
+    takeReplay(std::unique_ptr<LedgerReplay> replay);
+    std::unique_ptr<LedgerReplay>
+    releaseReplay();
+
+    // Fetch Packs
+    void
+    gotFetchPack(bool progress, std::uint32_t seq);
+
+    void
+    addFetchPack(uint256 const& hash, std::shared_ptr<Blob> data);
+
+    std::optional<Blob>
+    getFetchPack(uint256 const& hash) override;
+
+    void
+    makeFetchPack(
+        std::weak_ptr<Peer> const& wPeer,
+        std::shared_ptr<protocol::TMGetObjectByHash> const& request,
+        uint256 haveLedgerHash,
+        UptimeClock::time_point uptime);
+
+    std::size_t
+    getFetchPackCacheSize() const;
+
+    /**
+     * Whether we have ever fully validated a ledger.
+     */
+    bool
+    haveValidated()
+    {
+        return !validLedger_.empty();
+    }
+
+    // Returns the minimum ledger sequence in SQL database, if any.
+    std::optional<LedgerIndex>
+    minSqlSeq();
+
+    // Iff a txn exists at the specified ledger and offset then return its txnid
+    std::optional<uint256>
+    txnIdFromIndex(uint32_t ledgerSeq, uint32_t txnIndex);
+
+private:
+    void
+    setValidLedger(std::shared_ptr<Ledger const> const& l);
+    void
+    setPubLedger(std::shared_ptr<Ledger const> const& l);
+
+    void
+    tryFill(std::shared_ptr<Ledger const> ledger);
+
+    void
+    getFetchPack(LedgerIndex missing, InboundLedger::Reason reason);
+
+    std::optional<LedgerHash>
+    getLedgerHashForHistory(LedgerIndex index, InboundLedger::Reason reason);
+
+    std::size_t
+    getNeededValidations();
+    void
+    fetchForHistory(
+        std::uint32_t missing,
+        bool& progress,
+        InboundLedger::Reason reason,
+        std::unique_lock<std::recursive_mutex>&);
+    // Try to publish ledgers, acquire missing ledgers.  Always called with
+    // mutex_ locked.  The passed lock is a reminder to callers.
+    void
+    doAdvance(std::unique_lock<std::recursive_mutex>&);
+
+    std::vector<std::shared_ptr<Ledger const>>
+    findNewLedgersToPublish(std::unique_lock<std::recursive_mutex>&);
+
+    void
+    updatePaths();
+
+    // Returns true if work started.  Always called with mutex_ locked.
+    // The passed lock is a reminder to callers.
+    bool
+    newPFWork(char const* name, std::unique_lock<std::recursive_mutex>&);
+
+    Application& app_;
+    beast::Journal journal_;
+
+    std::recursive_mutex mutable mutex_;
+
+    // The ledger that most recently closed.
+    LedgerHolder closedLedger_;
+
+    // The highest-sequence ledger we have fully accepted.
+    LedgerHolder validLedger_;
+
+    // The last ledger we have published.
+    std::shared_ptr<Ledger const> pubLedger_;
+
+    // The last ledger we did pathfinding against.
+    std::shared_ptr<Ledger const> pathLedger_;
+
+    // The last ledger we handled fetching history
+    std::shared_ptr<Ledger const> histLedger_;
+
+    // Fully validated ledger, whether or not we have the ledger resident.
+    std::pair<uint256, LedgerIndex> lastValidLedger_{uint256(), 0};
+
+    LedgerHistory ledgerHistory_;
+
+    CanonicalTXSet heldTransactions_{uint256()};
+
+    // A set of transactions to replay during the next close
+    std::unique_ptr<LedgerReplay> replayData_;
+
+    std::recursive_mutex completeLock_;
+    RangeSet<std::uint32_t> completeLedgers_;
+
+    // Publish thread is running.
+    bool advanceThread_{false};
+
+    // Publish thread has work to do.
+    bool advanceWork_{false};
+    int fillInProgress_{0};
+
+    int pathFindThread_{0};  // Pathfinder jobs dispatched
+    bool pathFindNewRequest_{false};
+
+    std::atomic_flag gotFetchPackThread_ = ATOMIC_FLAG_INIT;  // GotFetchPack jobs dispatched
+
+    std::atomic<std::uint32_t> pubLedgerClose_{0};
+    std::atomic<LedgerIndex> pubLedgerSeq_{0};
+    std::atomic<std::uint32_t> validLedgerSign_{0};
+    std::atomic<LedgerIndex> validLedgerSeq_{0};
+    std::atomic<LedgerIndex> buildingLedgerSeq_{0};
+
+    // The server is in standalone mode
+    bool const standalone_;
+
+    // How many ledgers before the current ledger do we allow peers to request?
+    std::uint32_t const fetchDepth_;
+
+    // How much history do we want to keep
+    std::uint32_t const ledgerHistorySize_;
+
+    std::uint32_t const ledgerFetchSize_;
+
+    TaggedCache<uint256, Blob> fetchPacks_;
+
+    std::uint32_t fetchSeq_{0};
+
+    // Try to keep a validator from switching from test to live network
+    // without first wiping the database.
+    LedgerIndex const maxLedgerDifference_{1000000};
+
+    // Time that the previous upgrade warning was issued.
+    TimeKeeper::time_point upgradeWarningPrevTime_;
+
+private:
+    struct Stats
+    {
+        template <class Handler>
+        Stats(Handler const& handler, beast::insight::Collector::ptr const& collector)
+            : hook(collector->makeHook(handler))
+            , validatedLedgerAge(collector->makeGauge("LedgerMaster", "Validated_Ledger_Age"))
+            , publishedLedgerAge(collector->makeGauge("LedgerMaster", "Published_Ledger_Age"))
+        {
+        }
+
+        beast::insight::Hook hook;
+        beast::insight::Gauge validatedLedgerAge;
+        beast::insight::Gauge publishedLedgerAge;
+    };
+
+    Stats stats_;
+
+private:
+    void
+    collectMetrics()
+    {
+        std::scoped_lock const lock(mutex_);
+        stats_.validatedLedgerAge.set(getValidatedLedgerAge().count());
+        stats_.publishedLedgerAge.set(getPublishedLedgerAge().count());
+    }
+};
+
+}  // namespace xrpl

@@ -1,153 +1,212 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2012-2017 Ripple Labs Inc.
-
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
-
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
-
-#include <ripple/core/ConfigSections.h>
-#include <test/jtx/Env.h>
 #include <test/jtx/envconfig.h>
 
-namespace ripple {
-namespace test {
+#include <test/jtx/amount.h>
 
-int port_base = 8000;
-void
-incPorts(int times)
-{
-    port_base += (4 * times);
-}
+#include <xrpld/core/Config.h>
 
-std::atomic<bool> envUseIPv4{false};
+#include <xrpl/config/Constants.h>
+
+#include <atomic>
+#include <map>
+#include <memory>
+#include <vector>
+
+namespace xrpl::test {
+
+std::atomic<bool> gEnvUseIPv4{false};
 
 void
 setupConfigForUnitTests(Config& cfg)
 {
-    std::string const port_peer = std::to_string(port_base);
-    std::string port_rpc = std::to_string(port_base + 1);
-    std::string port_ws = std::to_string(port_base + 2);
+    using namespace jtx;
+    // Default fees to old values, so tests don't have to worry about changes in
+    // Config.h
+    cfg.fees.referenceFee = UNIT_TEST_REFERENCE_FEE;
+    cfg.fees.accountReserve = XRP(200).value().xrp().drops();
+    cfg.fees.ownerReserve = XRP(50).value().xrp().drops();
 
-    cfg.overwrite(ConfigSection::nodeDatabase(), "type", "memory");
-    cfg.overwrite(ConfigSection::nodeDatabase(), "path", "main");
-    cfg.deprecatedClearSection(ConfigSection::importNodeDatabase());
-    cfg.legacy("database_path", "");
+    // The Beta API (currently v2) is always available to tests
+    cfg.betaRpcApi = true;
+
+    cfg.overwrite(Sections::kNodeDatabase, Keys::kType, "memory");
+    cfg.overwrite(Sections::kNodeDatabase, Keys::kPath, "main");
+    cfg.deprecatedClearSection(Sections::kImportNodeDatabase);
+    cfg.legacy(Sections::kDatabasePath, "");
     cfg.setupControl(true, true, true);
-    cfg["server"].append("port_peer");
-    cfg["port_peer"].set("ip", getEnvLocalhostAddr());
-    cfg["port_peer"].set("port", port_peer);
-    cfg["port_peer"].set("protocol", "peer");
+    cfg[Sections::kServer].append(Sections::kPortPeer);
+    cfg[Sections::kPortPeer].set(Keys::kIp, getEnvLocalhostAddr());
 
-    cfg["server"].append("port_rpc");
-    cfg["port_rpc"].set("ip", getEnvLocalhostAddr());
-    cfg["port_rpc"].set("admin", getEnvLocalhostAddr());
-    cfg["port_rpc"].set("port", port_rpc);
-    cfg["port_rpc"].set("protocol", "http,ws2");
+    // Using port 0 asks the operating system to allocate an unused port, which
+    // can be obtained after a "bind" call.
+    // Works for all system (Linux, Windows, Unix, Mac).
+    // Check https://man7.org/linux/man-pages/man7/ip.7.html
+    // "ip_local_port_range" section for more info
+    cfg[Sections::kPortPeer].set(Keys::kPort, "0");
+    cfg[Sections::kPortPeer].set(Keys::kProtocol, "peer");
 
-    cfg["server"].append("port_ws");
-    cfg["port_ws"].set("ip", getEnvLocalhostAddr());
-    cfg["port_ws"].set("admin", getEnvLocalhostAddr());
-    cfg["port_ws"].set("port", port_ws);
-    cfg["port_ws"].set("protocol", "ws");
-    cfg.SSL_VERIFY = false;
+    cfg[Sections::kServer].append(Sections::kPortRpc);
+    cfg[Sections::kPortRpc].set(Keys::kIp, getEnvLocalhostAddr());
+    cfg[Sections::kPortRpc].set(Keys::kAdmin, getEnvLocalhostAddr());
+    cfg[Sections::kPortRpc].set(Keys::kPort, "0");
+    cfg[Sections::kPortRpc].set(Keys::kProtocol, "http,ws2");
+
+    cfg[Sections::kServer].append(Sections::kPortWs);
+    cfg[Sections::kPortWs].set(Keys::kIp, getEnvLocalhostAddr());
+    cfg[Sections::kPortWs].set(Keys::kAdmin, getEnvLocalhostAddr());
+    cfg[Sections::kPortWs].set(Keys::kPort, "0");
+    cfg[Sections::kPortWs].set(Keys::kProtocol, "ws");
+    cfg.sslVerify = false;
 }
 
 namespace jtx {
 
 std::unique_ptr<Config>
-no_admin(std::unique_ptr<Config> cfg)
+noAdmin(std::unique_ptr<Config> cfg)
 {
-    (*cfg)["port_rpc"].set("admin", "");
-    (*cfg)["port_ws"].set("admin", "");
+    (*cfg)[Sections::kPortRpc].set(Keys::kAdmin, "");
+    (*cfg)[Sections::kPortWs].set(Keys::kAdmin, "");
     return cfg;
 }
 
 std::unique_ptr<Config>
-secure_gateway(std::unique_ptr<Config> cfg)
+secureGateway(std::unique_ptr<Config> cfg)
 {
-    (*cfg)["port_rpc"].set("admin", "");
-    (*cfg)["port_ws"].set("admin", "");
-    (*cfg)["port_rpc"].set("secure_gateway", getEnvLocalhostAddr());
+    (*cfg)[Sections::kPortRpc].set(Keys::kAdmin, "");
+    (*cfg)[Sections::kPortWs].set(Keys::kAdmin, "");
+    (*cfg)[Sections::kPortRpc].set(Keys::kSecureGateway, getEnvLocalhostAddr());
     return cfg;
 }
 
 std::unique_ptr<Config>
-admin_localnet(std::unique_ptr<Config> cfg)
+adminLocalnet(std::unique_ptr<Config> cfg)
 {
-    (*cfg)["port_rpc"].set("admin", "127.0.0.0/8");
-    (*cfg)["port_ws"].set("admin", "127.0.0.0/8");
+    (*cfg)[Sections::kPortRpc].set(Keys::kAdmin, "127.0.0.0/8");
+    (*cfg)[Sections::kPortWs].set(Keys::kAdmin, "127.0.0.0/8");
     return cfg;
 }
 
 std::unique_ptr<Config>
-secure_gateway_localnet(std::unique_ptr<Config> cfg)
+secureGatewayLocalnet(std::unique_ptr<Config> cfg)
 {
-    (*cfg)["port_rpc"].set("admin", "");
-    (*cfg)["port_ws"].set("admin", "");
-    (*cfg)["port_rpc"].set("secure_gateway", "127.0.0.0/8");
-    (*cfg)["port_ws"].set("secure_gateway", "127.0.0.0/8");
+    (*cfg)[Sections::kPortRpc].set(Keys::kAdmin, "");
+    (*cfg)[Sections::kPortWs].set(Keys::kAdmin, "");
+    (*cfg)[Sections::kPortRpc].set(Keys::kSecureGateway, "127.0.0.0/8");
+    (*cfg)[Sections::kPortWs].set(Keys::kSecureGateway, "127.0.0.0/8");
+    return cfg;
+}
+std::unique_ptr<Config>
+singleThreadIo(std::unique_ptr<Config> cfg)
+{
+    cfg->ioWorkers = 1;
     return cfg;
 }
 
-auto constexpr defaultseed = "shUwVw52ofnCUX5m7kPTKzJdr4HEH";
+constexpr auto kDefaultSeed = "shUwVw52ofnCUX5m7kPTKzJdr4HEH";
 
 std::unique_ptr<Config>
 validator(std::unique_ptr<Config> cfg, std::string const& seed)
 {
     // If the config has valid validation keys then we run as a validator.
-    cfg->section(SECTION_VALIDATION_SEED)
-        .append(std::vector<std::string>{seed.empty() ? defaultseed : seed});
-    return cfg;
-}
-
-std::unique_ptr<Config>
-port_increment(std::unique_ptr<Config> cfg, int increment)
-{
-    for (auto const sectionName : {"port_peer", "port_rpc", "port_ws"})
-    {
-        Section& s = (*cfg)[sectionName];
-        auto const port = s.get<std::int32_t>("port");
-        if (port)
-        {
-            s.set("port", std::to_string(*port + increment));
-        }
-    }
+    cfg->section(Sections::kValidationSeed)
+        .append(std::vector<std::string>{seed.empty() ? kDefaultSeed : seed});
     return cfg;
 }
 
 std::unique_ptr<Config>
 addGrpcConfig(std::unique_ptr<Config> cfg)
 {
-    std::string port_grpc = std::to_string(port_base + 3);
-    (*cfg)["port_grpc"].set("ip", getEnvLocalhostAddr());
-    (*cfg)["port_grpc"].set("port", port_grpc);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kIp, getEnvLocalhostAddr());
+    (*cfg)[Sections::kPortGrpc].set(Keys::kPort, "0");
     return cfg;
 }
 
 std::unique_ptr<Config>
-addGrpcConfigWithSecureGateway(
-    std::unique_ptr<Config> cfg,
-    std::string const& secureGateway)
+addGrpcConfigWithSecureGateway(std::unique_ptr<Config> cfg, std::string const& secureGateway)
 {
-    std::string port_grpc = std::to_string(port_base + 3);
-    (*cfg)["port_grpc"].set("ip", getEnvLocalhostAddr());
-    (*cfg)["port_grpc"].set("port", port_grpc);
-    (*cfg)["port_grpc"].set("secure_gateway", secureGateway);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kIp, getEnvLocalhostAddr());
+
+    // Check https://man7.org/linux/man-pages/man7/ip.7.html
+    // "ip_local_port_range" section for using 0 ports
+    (*cfg)[Sections::kPortGrpc].set(Keys::kPort, "0");
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSecureGateway, secureGateway);
     return cfg;
 }
 
+std::unique_ptr<Config>
+addGrpcConfigWithTLS(
+    std::unique_ptr<Config> cfg,
+    std::string const& certPath,
+    std::string const& keyPath)
+{
+    (*cfg)[Sections::kPortGrpc].set(Keys::kIp, getEnvLocalhostAddr());
+    (*cfg)[Sections::kPortGrpc].set(Keys::kPort, "0");
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslCert, certPath);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslKey, keyPath);
+    return cfg;
+}
+
+std::unique_ptr<Config>
+addGrpcConfigWithTLSAndClientCA(
+    std::unique_ptr<Config> cfg,
+    std::string const& certPath,
+    std::string const& keyPath,
+    std::string const& clientCAPath)
+{
+    (*cfg)[Sections::kPortGrpc].set(Keys::kIp, getEnvLocalhostAddr());
+    (*cfg)[Sections::kPortGrpc].set(Keys::kPort, "0");
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslCert, certPath);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslKey, keyPath);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslClientCa, clientCAPath);
+    return cfg;
+}
+
+std::unique_ptr<Config>
+addGrpcConfigWithTLSAndCertChain(
+    std::unique_ptr<Config> cfg,
+    std::string const& certPath,
+    std::string const& keyPath,
+    std::string const& certChainPath)
+{
+    (*cfg)[Sections::kPortGrpc].set(Keys::kIp, getEnvLocalhostAddr());
+    (*cfg)[Sections::kPortGrpc].set(Keys::kPort, "0");
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslCert, certPath);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslKey, keyPath);
+    (*cfg)[Sections::kPortGrpc].set(Keys::kSslCertChain, certChainPath);
+    return cfg;
+}
+
+std::unique_ptr<Config>
+makeConfig(
+    std::map<std::string, std::string> extraTxQ,
+    std::map<std::string, std::string> extraVoting)
+{
+    auto p = test::jtx::envconfig();
+    auto& section = p->section(Sections::kTransactionQueue);
+    section.set(Keys::kLedgersInQueue, "2");
+    section.set(Keys::kMinimumQueueSize, "2");
+    section.set(Keys::kMinLedgersToComputeSizeLimit, "3");
+    section.set(Keys::kMaxLedgerCountsToStore, "100");
+    section.set(Keys::kRetrySequencePercent, "25");
+    section.set(Keys::kNormalConsensusIncreasePercent, "0");
+
+    for (auto const& [k, v] : extraTxQ)
+        section.set(k, v);
+
+    // Some tests specify different fee settings that are enabled by
+    // a FeeVote
+    if (!extraVoting.empty())
+    {
+        auto& votingSection = p->section(Sections::kVoting);
+        for (auto const& [k, v] : extraVoting)
+        {
+            votingSection.set(k, v);
+        }
+
+        // In order for the vote to occur, we must run as a validator
+        p->section(Sections::kValidationSeed).legacy("shUwVw52ofnCUX5m7kPTKzJdr4HEH");
+    }
+    return p;
+}
+
 }  // namespace jtx
-}  // namespace test
-}  // namespace ripple
+}  // namespace xrpl::test

@@ -1,37 +1,24 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2012-2016 Ripple Labs Inc.
 
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
+#include <test/jtx/Env.h>
+#include <test/jtx/envconfig.h>
 
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
+#include <xrpld/core/Config.h>
 
-#include <ripple/beast/unit_test.h>
-#include <ripple/protocol/jss.h>
-#include <test/jtx.h>
+#include <xrpl/beast/unit_test/suite.h>
+#include <xrpl/config/Constants.h>
+#include <xrpl/protocol/jss.h>
+#include <xrpl/server/NetworkOPs.h>
 
-#include <boost/format.hpp>
+#include <boost/format/free_funcs.hpp>
 
-namespace ripple {
+#include <memory>
 
-namespace test {
+namespace xrpl::test {
 
 namespace validator_data {
-static auto const public_key =
-    "nHBt9fsb4849WmZiCds4r5TXyBeQjqnH5kzPtqgMAQMgi39YZRPa";
+static auto const kPublicKey = "nHBt9fsb4849WmZiCds4r5TXyBeQjqnH5kzPtqgMAQMgi39YZRPa";
 
-static auto const token =
+static auto const kToken =
     "eyJ2YWxpZGF0aW9uX3NlY3JldF9rZXkiOiI5ZWQ0NWY4NjYyNDFjYzE4YTI3NDdiNT\n"
     "QzODdjMDYyNTkwNzk3MmY0ZTcxOTAyMzFmYWE5Mzc0NTdmYTlkYWY2IiwibWFuaWZl\n"
     "c3QiOiJKQUFBQUFGeEllMUZ0d21pbXZHdEgyaUNjTUpxQzlnVkZLaWxHZncxL3ZDeE\n"
@@ -42,23 +29,32 @@ static auto const token =
     "VUSmEydzBpMjFlcTNNWXl3TFZKWm5GT3I3QzBrdzJBaVR6U0NqSXpkaXRROD0ifQ==\n";
 }  // namespace validator_data
 
-class ServerInfo_test : public beast::unit_test::suite
+class ServerInfo_test : public beast::unit_test::Suite
 {
 public:
     static std::unique_ptr<Config>
     makeValidatorConfig()
     {
         auto p = std::make_unique<Config>();
-        boost::format toLoad(R"rippleConfig(
+        boost::format toLoad(R"xrpldConfig(
 [validator_token]
 %1%
 
 [validators]
 %2%
-)rippleConfig");
 
-        p->loadFromString(boost::str(
-            toLoad % validator_data::token % validator_data::public_key));
+[port_grpc]
+ip = 0.0.0.0
+port = 50051
+
+[port_admin]
+ip = 0.0.0.0
+port = 50052
+protocol = wss2
+admin = 127.0.0.1
+)xrpldConfig");
+
+        p->loadFromString(boost::str(toLoad % validator_data::kToken % validator_data::kPublicKey));
 
         setupConfigForUnitTests(*p);
 
@@ -68,24 +64,90 @@ public:
     void
     testServerInfo()
     {
+        testcase("server_info");
+
         using namespace test::jtx;
 
         {
             Env env(*this);
-            auto const result = env.rpc("server_info");
-            BEAST_EXPECT(!result[jss::result].isMember(jss::error));
-            BEAST_EXPECT(result[jss::result][jss::status] == "success");
-            BEAST_EXPECT(result[jss::result].isMember(jss::info));
+            auto const serverinfo = env.rpc("server_info");
+            BEAST_EXPECT(serverinfo.isMember(jss::result));
+            auto const& result = serverinfo[jss::result];
+            BEAST_EXPECT(!result.isMember(jss::error));
+            BEAST_EXPECT(result[jss::status] == "success");
+            BEAST_EXPECT(result.isMember(jss::info));
+            auto const& info = result[jss::info];
+            BEAST_EXPECT(info.isMember(jss::build_version));
+            // Git info is not guaranteed to be present
+            if (info.isMember(jss::git))
+            {
+                auto const& git = info[jss::git];
+                BEAST_EXPECT(git.isMember(jss::hash) || git.isMember(jss::branch));
+                BEAST_EXPECT(
+                    !git.isMember(jss::hash) ||
+                    (git[jss::hash].isString() && git[jss::hash].asString().size() == 40));
+                BEAST_EXPECT(
+                    !git.isMember(jss::branch) ||
+                    (git[jss::branch].isString() && !git[jss::branch].asString().empty()));
+            }
         }
+
+        {
+            Env env(*this);
+
+            // Call NetworkOPs directly and set the admin flag to false.
+            auto const result = env.app().getOPs().getServerInfo(true, false, false);
+            // Expect that the admin ports are not included in the result.
+            auto const& ports = result[jss::ports];
+            BEAST_EXPECT(ports.isArray() && ports.size() == 0);
+            // Expect that git info is absent
+            BEAST_EXPECT(!result.isMember(jss::git));
+        }
+
         {
             Env env(*this, makeValidatorConfig());
+            auto const& config = env.app().config();
+
+            auto const rpcPort = config[Sections::kPortRpc].get<unsigned int>(Keys::kPort);
+            auto const grpcPort = config[Sections::kPortGrpc].get<unsigned int>(Keys::kPort);
+            auto const wsPort = config[Sections::kPortWs].get<unsigned int>(Keys::kPort);
+            BEAST_EXPECT(grpcPort);
+            BEAST_EXPECT(rpcPort);
+            BEAST_EXPECT(wsPort);
+
             auto const result = env.rpc("server_info");
             BEAST_EXPECT(!result[jss::result].isMember(jss::error));
             BEAST_EXPECT(result[jss::result][jss::status] == "success");
             BEAST_EXPECT(result[jss::result].isMember(jss::info));
             BEAST_EXPECT(
                 result[jss::result][jss::info][jss::pubkey_validator] ==
-                validator_data::public_key);
+                validator_data::kPublicKey);
+
+            auto const& ports = result[jss::result][jss::info][jss::ports];
+            BEAST_EXPECT(ports.isArray() && ports.size() == 3);
+            for (auto const& port : ports)
+            {
+                auto const& proto = port[jss::protocol];
+                BEAST_EXPECT(proto.isArray());
+                auto const p = port[jss::port].asUInt();
+                BEAST_EXPECT(p == rpcPort || p == wsPort || p == grpcPort);
+                if (p == grpcPort)
+                {
+                    BEAST_EXPECT(proto.size() == 1);
+                    BEAST_EXPECT(proto[0u].asString() == "grpc");
+                }
+                if (p == rpcPort)
+                {
+                    BEAST_EXPECT(proto.size() == 2);
+                    BEAST_EXPECT(proto[0u].asString() == "http");
+                    BEAST_EXPECT(proto[1u].asString() == "ws2");
+                }
+                if (p == wsPort)
+                {
+                    BEAST_EXPECT(proto.size() == 1);
+                    BEAST_EXPECT(proto[0u].asString() == "ws");
+                }
+            }
         }
     }
 
@@ -96,7 +158,6 @@ public:
     }
 };
 
-BEAST_DEFINE_TESTSUITE(ServerInfo, app, ripple);
+BEAST_DEFINE_TESTSUITE(ServerInfo, rpc, xrpl);
 
-}  // namespace test
-}  // namespace ripple
+}  // namespace xrpl::test

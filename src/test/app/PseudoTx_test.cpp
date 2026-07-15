@@ -1,89 +1,91 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2017 Ripple Labs Inc.
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
 
-#include <ripple/app/tx/apply.h>
-#include <ripple/protocol/STAccount.h>
+#include <test/jtx/Env.h>
+
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/beast/unit_test/suite.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/ledger/ApplyView.h>
+#include <xrpl/ledger/OpenView.h>
+#include <xrpl/protocol/Feature.h>
+#include <xrpl/protocol/Rules.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/TxFormats.h>
+#include <xrpl/tx/apply.h>
+
+#include <cstdint>
 #include <string>
-#include <test/jtx.h>
 #include <vector>
 
-namespace ripple {
-namespace test {
+namespace xrpl::test {
 
-struct PseudoTx_test : public beast::unit_test::suite
+struct PseudoTx_test : public beast::unit_test::Suite
 {
-    std::vector<STTx>
-    getPseudoTxs(std::uint32_t seq)
+    static std::vector<STTx>
+    getPseudoTxs(Rules const& rules, std::uint32_t seq)
     {
         std::vector<STTx> res;
 
-        res.emplace_back(STTx(ttFEE, [&](auto& obj) {
+        res.emplace_back(ttFEE, [&](auto& obj) {
             obj[sfAccount] = AccountID();
             obj[sfLedgerSequence] = seq;
-            obj[sfBaseFee] = 0;
-            obj[sfReserveBase] = 0;
-            obj[sfReserveIncrement] = 0;
-            obj[sfReferenceFeeUnits] = 0;
-        }));
+            if (rules.enabled(featureXRPFees))
+            {
+                obj[sfBaseFeeDrops] = XRPAmount{0};
+                obj[sfReserveBaseDrops] = XRPAmount{0};
+                obj[sfReserveIncrementDrops] = XRPAmount{0};
+            }
+            else
+            {
+                obj[sfBaseFee] = 0;
+                obj[sfReserveBase] = 0;
+                obj[sfReserveIncrement] = 0;
+                obj[sfReferenceFeeUnits] = 0;
+            }
+        });
 
-        res.emplace_back(STTx(ttAMENDMENT, [&](auto& obj) {
+        res.emplace_back(ttAMENDMENT, [&](auto& obj) {
             obj.setAccountID(sfAccount, AccountID());
             obj.setFieldH256(sfAmendment, uint256(2));
             obj.setFieldU32(sfLedgerSequence, seq);
-        }));
+        });
 
         return res;
     }
 
-    std::vector<STTx>
+    static std::vector<STTx>
     getRealTxs()
     {
         std::vector<STTx> res;
 
-        res.emplace_back(STTx(
-            ttACCOUNT_SET, [&](auto& obj) { obj[sfAccount] = AccountID(1); }));
+        res.emplace_back(ttACCOUNT_SET, [&](auto& obj) { obj[sfAccount] = AccountID(1); });
 
-        res.emplace_back(STTx(ttPAYMENT, [&](auto& obj) {
+        res.emplace_back(ttPAYMENT, [&](auto& obj) {
             obj.setAccountID(sfAccount, AccountID(2));
             obj.setAccountID(sfDestination, AccountID(3));
-        }));
+        });
 
         return res;
     }
 
     void
-    testPrevented()
+    testPrevented(FeatureBitset features)
     {
         using namespace jtx;
-        Env env(*this);
+        Env env(*this, features);
 
-        for (auto const& stx : getPseudoTxs(env.closed()->seq() + 1))
+        for (auto const& stx : getPseudoTxs(env.closed()->rules(), env.closed()->seq() + 1))
         {
             std::string reason;
             BEAST_EXPECT(isPseudoTx(stx));
             BEAST_EXPECT(!passesLocalChecks(stx, reason));
             BEAST_EXPECT(reason == "Cannot submit pseudo transactions.");
-            env.app().openLedger().modify(
-                [&](OpenView& view, beast::Journal j) {
-                    auto const result =
-                        ripple::apply(env.app(), view, stx, tapNONE, j);
-                    BEAST_EXPECT(!result.second && result.first == temINVALID);
-                    return result.second;
-                });
+            env.app().getOpenLedger().modify([&](OpenView& view, beast::Journal j) {
+                auto const result = xrpl::apply(env.app(), view, stx, TapNone, j);
+                BEAST_EXPECT(!result.applied && result.ter == temINVALID);
+                return result.applied;
+            });
         }
     }
 
@@ -101,12 +103,16 @@ struct PseudoTx_test : public beast::unit_test::suite
     void
     run() override
     {
-        testPrevented();
+        using namespace test::jtx;
+        FeatureBitset const all{testableAmendments()};
+        FeatureBitset const xrpFees{featureXRPFees};
+
+        testPrevented(all - featureXRPFees);
+        testPrevented(all);
         testAllowed();
     }
 };
 
-BEAST_DEFINE_TESTSUITE(PseudoTx, app, ripple);
+BEAST_DEFINE_TESTSUITE(PseudoTx, app, xrpl);
 
-}  // namespace test
-}  // namespace ripple
+}  // namespace xrpl::test

@@ -1,0 +1,831 @@
+#pragma once
+
+#include <xrpld/app/consensus/RCLCxPeerPos.h>
+#include <xrpld/app/ledger/detail/LedgerReplayMsgHandler.h>
+#include <xrpld/app/main/Application.h>
+#include <xrpld/overlay/Compression.h>
+#include <xrpld/overlay/Message.h>
+#include <xrpld/overlay/Peer.h>
+#include <xrpld/overlay/Squelch.h>
+#include <xrpld/overlay/detail/OverlayImpl.h>
+#include <xrpld/overlay/detail/ProtocolVersion.h>
+#include <xrpld/peerfinder/PeerfinderManager.h>
+#include <xrpld/peerfinder/Slot.h>
+
+#include <xrpl/basics/Log.h>
+#include <xrpl/basics/Number.h>
+#include <xrpl/basics/UnorderedContainers.h>
+#include <xrpl/basics/UptimeClock.h>
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/beast/net/IPEndpoint.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/beast/utility/WrappedSink.h>
+#include <xrpl/beast/utility/instrumentation.h>
+#include <xrpl/core/HashRouter.h>
+#include <xrpl/core/LoadEvent.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/protocol/Protocol.h>
+#include <xrpl/protocol/PublicKey.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/STValidation.h>
+#include <xrpl/resource/Charge.h>
+#include <xrpl/resource/Consumer.h>
+#include <xrpl/resource/Fees.h>
+#include <xrpl/server/Handoff.h>
+
+#include <boost/circular_buffer.hpp>
+#include <boost/endian/conversion.hpp>
+#include <boost/thread/shared_mutex.hpp>
+
+#include <google/protobuf/message.h>
+
+#include <xrpl.pb.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <shared_mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace xrpl {
+
+struct ValidatorBlobInfo;
+class SHAMap;
+
+class PeerImp : public Peer, public std::enable_shared_from_this<PeerImp>, public OverlayImpl::Child
+{
+public:
+    /**
+     * Whether the peer's view of the ledger converges or diverges from ours
+     */
+    enum class Tracking { Diverged, Unknown, Converged };
+
+private:
+    using clock_type = std::chrono::steady_clock;
+    using error_code = boost::system::error_code;
+    using socket_type = boost::asio::ip::tcp::socket;
+    using middle_type = boost::beast::tcp_stream;
+    using stream_type = boost::beast::ssl_stream<middle_type>;
+    using address_type = boost::asio::ip::address;
+    using endpoint_type = boost::asio::ip::tcp::endpoint;
+    using waitable_timer = boost::asio::basic_waitable_timer<std::chrono::steady_clock>;
+    using Compressed = compression::Compressed;
+
+    Application& app_;
+    id_t const id_;
+    std::string fingerprint_;
+    std::string prefix_;
+    beast::WrappedSink sink_;
+    beast::WrappedSink pSink_;
+    beast::Journal const journal_;
+    beast::Journal const pJournal_;
+    std::unique_ptr<stream_type> streamPtr_;
+    socket_type& socket_;
+    stream_type& stream_;
+    boost::asio::strand<boost::asio::executor> strand_;
+    waitable_timer timer_;
+
+    // Updated at each stage of the connection process to reflect
+    // the current conditions as closely as possible.
+    beast::IP::Endpoint const remoteAddress_;
+
+    // These are up here to prevent warnings about order of initializations
+    //
+    OverlayImpl& overlay_;
+    bool const inbound_;
+
+    // Protocol version to use for this link
+    ProtocolVersion protocol_;
+
+    std::atomic<Tracking> tracking_;
+    clock_type::time_point trackingTime_;
+    bool detaching_ = false;
+    // Node public key of peer.
+    PublicKey const publicKey_;
+    std::string name_;
+    std::shared_mutex mutable nameMutex_;
+
+    // The indices of the smallest and largest ledgers this peer has available
+    //
+    LedgerIndex minLedger_ = 0;
+    LedgerIndex maxLedger_ = 0;
+    uint256 closedLedgerHash_;
+    uint256 previousLedgerHash_;
+
+    boost::circular_buffer<uint256> recentLedgers_{128};
+    boost::circular_buffer<uint256> recentTxSets_{128};
+
+    std::optional<std::chrono::milliseconds> latency_;
+    std::optional<std::uint32_t> lastPingSeq_;
+    clock_type::time_point lastPingTime_;
+    clock_type::time_point const creationTime_;
+
+    reduce_relay::Squelch<UptimeClock> squelch_;
+
+    // Notes on thread locking:
+    //
+    // During an audit it was noted that some member variables that looked
+    // like they need thread protection were not receiving it.  And, indeed,
+    // that was correct.  But the multi-phase initialization of PeerImp
+    // makes such an audit difficult.  A further audit suggests that the
+    // locking is now protecting variables that don't need it.  We're
+    // leaving that locking in place (for now) as a form of future proofing.
+    //
+    // Here are the variables that appear to need locking currently:
+    //
+    // o closedLedgerHash_
+    // o previousLedgerHash_
+    // o minLedger_
+    // o maxLedger_
+    // o recentLedgers_
+    // o recentTxSets_
+    // o trackingTime_
+    // o latency_
+    //
+    // The following variables are being protected preemptively:
+    //
+    // o name_
+    // o lastStatus_
+    //
+    // June 2019
+
+    struct ChargeWithContext
+    {
+        Resource::Charge fee = Resource::kFeeTrivialPeer;
+        std::string context{};  // NOLINT(readability-redundant-member-init)
+
+        void
+        update(Resource::Charge f, std::string const& add)
+        {
+            XRPL_ASSERT(f >= fee, "xrpl::PeerImp::ChargeWithContext::update : fee increases");
+            fee = f;
+            if (!context.empty())
+            {
+                context += " ";
+            }
+            context += add;
+        }
+    };
+
+    std::mutex mutable recentLock_;
+    protocol::TMStatusChange lastStatus_;
+    Resource::Consumer usage_;
+    ChargeWithContext fee_;
+
+    // One-shot guard so concurrent JobQueue workers cannot double-count
+    // the per-connection peer-disconnect-by-charge metric (and cannot
+    // post duplicate fail() calls) when several queued requests cross
+    // kDropThreshold before the first fail() lands on the strand.
+    std::atomic<bool> chargeDisconnectFired_{false};
+    std::shared_ptr<PeerFinder::Slot> const slot_;
+    boost::beast::multi_buffer readBuffer_;
+    http_request_type request_;
+    http_response_type response_;
+    boost::beast::http::fields const& headers_;
+    std::queue<std::shared_ptr<Message>> sendQueue_;
+    bool gracefulClose_ = false;
+    int largeSendq_ = 0;
+    std::unique_ptr<LoadEvent> loadEvent_;
+    // The highest sequence of each PublisherList that has
+    // been sent to or received from this peer.
+    hash_map<PublicKey, std::size_t> publisherListSequences_;
+
+    Compressed compressionEnabled_ = Compressed::Off;
+
+    // Queue of transactions' hashes that have not been
+    // relayed. The hashes are sent once a second to a peer
+    // and the peer requests missing transactions from the node.
+    hash_set<uint256> txQueue_;
+    // true if tx reduce-relay feature is enabled on the peer.
+    bool txReduceRelayEnabled_ = false;
+
+    bool ledgerReplayEnabled_ = false;
+    LedgerReplayMsgHandler ledgerReplayMsgHandler_;
+
+    friend class OverlayImpl;
+
+    class Metrics
+    {
+    public:
+        Metrics() = default;
+        Metrics(Metrics const&) = delete;
+        Metrics&
+        operator=(Metrics const&) = delete;
+        Metrics(Metrics&&) = delete;
+        Metrics&
+        operator=(Metrics&&) = delete;
+
+        void
+        addMessage(std::uint64_t bytes);
+        std::uint64_t
+        averageBytes() const;
+        std::uint64_t
+        totalBytes() const;
+
+    private:
+        std::shared_mutex mutable mutex_;
+        boost::circular_buffer<std::uint64_t> rollingAvg_{30, 0ull};
+        clock_type::time_point intervalStart_{clock_type::now()};
+        std::uint64_t totalBytes_{0};
+        std::uint64_t accumBytes_{0};
+        std::uint64_t rollingAvgBytes_{0};
+    };
+
+    struct
+    {
+        Metrics sent;
+        Metrics recv;
+    } metrics_;
+
+public:
+    PeerImp(PeerImp const&) = delete;
+    PeerImp&
+    operator=(PeerImp const&) = delete;
+
+    /**
+     * Create an active incoming peer from an established ssl connection.
+     */
+    PeerImp(
+        Application& app,
+        id_t id,
+        std::shared_ptr<PeerFinder::Slot> const& slot,
+        http_request_type&& request,
+        PublicKey const& publicKey,
+        ProtocolVersion protocol,
+        Resource::Consumer consumer,
+        std::unique_ptr<stream_type>&& streamPtr,
+        OverlayImpl& overlay);
+
+    /**
+     * Create outgoing, handshaked peer.
+     */
+    // VFALCO legacyPublicKey should be implied by the Slot
+    template <class Buffers>
+    PeerImp(
+        Application& app,
+        std::unique_ptr<stream_type>&& streamPtr,
+        Buffers const& buffers,
+        std::shared_ptr<PeerFinder::Slot>&& slot,
+        http_response_type&& response,
+        Resource::Consumer usage,
+        PublicKey const& publicKey,
+        ProtocolVersion protocol,
+        id_t id,
+        OverlayImpl& overlay);
+
+    ~PeerImp() override;
+
+    beast::Journal const&
+    pJournal() const
+    {
+        return pJournal_;
+    }
+
+    std::shared_ptr<PeerFinder::Slot> const&
+    slot()
+    {
+        return slot_;
+    }
+
+    // Work-around for calling shared_from_this in constructors
+    virtual void
+    run();
+
+    // Called when Overlay gets a stop request.
+    void
+    stop() override;
+
+    //
+    // Network
+    //
+
+    void
+    send(std::shared_ptr<Message> const& m) override;
+
+    /**
+     * Send aggregated transactions' hashes
+     */
+    void
+    sendTxQueue() override;
+
+    /**
+     * Add transaction's hash to the transactions' hashes queue
+     * @param hash transaction's hash
+     */
+    void
+    addTxQueue(uint256 const& hash) override;
+
+    /**
+     * Remove transaction's hash from the transactions' hashes queue
+     * @param hash transaction's hash
+     */
+    void
+    removeTxQueue(uint256 const& hash) override;
+
+    /**
+     * Send a set of PeerFinder endpoints as a protocol message.
+     */
+    template <class FwdIt>
+    void
+    sendEndpoints(FwdIt first, FwdIt last)
+        requires(
+            std::is_same_v<typename std::iterator_traits<FwdIt>::value_type, PeerFinder::Endpoint>);
+
+    beast::IP::Endpoint
+    getRemoteAddress() const override
+    {
+        return remoteAddress_;
+    }
+
+    void
+    charge(Resource::Charge const& fee, std::string const& context) override;
+
+    //
+    // Identity
+    //
+
+    Peer::id_t
+    id() const override
+    {
+        return id_;
+    }
+
+    /**
+     * Returns `true` if this connection will publicly share its IP address.
+     */
+    bool
+    crawl() const;
+
+    bool
+    cluster() const override;
+
+    /**
+     * Check if the peer is tracking
+     * @param validationSeq The ledger sequence of a recently-validated ledger
+     */
+    void
+    checkTracking(std::uint32_t validationSeq);
+
+    void
+    checkTracking(std::uint32_t seq1, std::uint32_t seq2);
+
+    PublicKey const&
+    getNodePublic() const override
+    {
+        return publicKey_;
+    }
+
+    /**
+     * Return the version of xrpld that the peer is running, if reported.
+     */
+    std::string
+    getVersion() const;
+
+    // Return the connection elapsed time.
+    clock_type::duration
+    uptime() const
+    {
+        return clock_type::now() - creationTime_;
+    }
+
+    json::Value
+    json() override;
+
+    bool
+    supportsFeature(ProtocolFeature f) const override;
+
+    std::optional<std::size_t>
+    publisherListSequence(PublicKey const& pubKey) const override
+    {
+        std::scoped_lock const sl(recentLock_);
+
+        auto iter = publisherListSequences_.find(pubKey);
+        if (iter != publisherListSequences_.end())
+            return iter->second;
+        return {};
+    }
+
+    void
+    setPublisherListSequence(PublicKey const& pubKey, std::size_t const seq) override
+    {
+        std::scoped_lock const sl(recentLock_);
+
+        publisherListSequences_[pubKey] = seq;
+    }
+
+    //
+    // Ledger
+    //
+
+    uint256 const&
+    getClosedLedgerHash() const override
+    {
+        return closedLedgerHash_;
+    }
+
+    bool
+    hasLedger(uint256 const& hash, std::uint32_t seq) const override;
+
+    void
+    ledgerRange(std::uint32_t& minSeq, std::uint32_t& maxSeq) const override;
+
+    bool
+    hasTxSet(uint256 const& hash) const override;
+
+    void
+    cycleStatus() override;
+
+    bool
+    hasRange(std::uint32_t uMin, std::uint32_t uMax) override;
+
+    // Called to determine our priority for querying
+    int
+    getScore(bool haveItem) const override;
+
+    bool
+    isHighLatency() const override;
+
+    void
+    fail(std::string const& reason);
+
+    bool
+    compressionEnabled() const override
+    {
+        return compressionEnabled_ == Compressed::On;
+    }
+
+    bool
+    txReduceRelayEnabled() const override
+    {
+        return txReduceRelayEnabled_;
+    }
+
+private:
+    void
+    close();
+
+    void
+    fail(std::string const& name, error_code ec);
+
+    void
+    gracefulClose();
+
+    void
+    setTimer();
+
+    void
+    cancelTimer() noexcept;
+
+    static std::string
+    makePrefix(std::string const& fingerprint);
+
+    // Called when the timer wait completes
+    void
+    onTimer(boost::system::error_code const& ec);
+
+    // Called when SSL shutdown completes
+    void
+    onShutdown(error_code ec);
+
+    void
+    doAccept();
+
+    std::string
+    name() const;
+
+    std::string
+    domain() const;
+
+    //
+    // protocol message loop
+    //
+
+    // Starts the protocol message loop
+    void
+    doProtocolStart();
+
+    // Called when protocol message bytes are received
+    void
+    onReadMessage(error_code ec, std::size_t bytesTransferred);
+
+    // Called when protocol messages bytes are sent
+    void
+    onWriteMessage(error_code ec, std::size_t bytesTransferred);
+
+    /**
+     * Called from onMessage(TMTransaction(s)).
+     * @param m Transaction protocol message
+     * @param eraseTxQueue is true when called from onMessage(TMTransaction)
+     * and is false when called from onMessage(TMTransactions). If true then
+     * the transaction hash is erased from txQueue_. Don't need to erase from
+     * the queue when called from onMessage(TMTransactions) because this
+     * message is a response to the missing transactions request and the queue
+     * would not have any of these transactions.
+     * @param batch is false when called from onMessage(TMTransaction)
+     * and is true when called from onMessage(TMTransactions). If true, then the
+     * transaction is part of a batch, and should not be charged an extra fee.
+     */
+    void
+    handleTransaction(
+        std::shared_ptr<protocol::TMTransaction> const& m,
+        bool eraseTxQueue,
+        bool batch);
+
+    /**
+     * Handle protocol message with hashes of transactions that have not
+     * been relayed by an upstream node down to its peers - request
+     * transactions, which have not been relayed to this peer.
+     * @param m protocol message with transactions' hashes
+     */
+    void
+    handleHaveTransactions(std::shared_ptr<protocol::TMHaveTransactions> const& m);
+
+    std::string const&
+    fingerprint() const override
+    {
+        return fingerprint_;
+    }
+
+    std::string const&
+    prefix() const
+    {
+        return prefix_;
+    }
+
+public:
+    //--------------------------------------------------------------------------
+    //
+    // ProtocolStream
+    //
+    //--------------------------------------------------------------------------
+
+    void
+    onMessageUnknown(std::uint16_t type);
+
+    void
+    onMessageBegin(
+        std::uint16_t type,
+        std::shared_ptr<::google::protobuf::Message> const& m,
+        std::size_t size,
+        std::size_t uncompressedSize,
+        bool isCompressed);
+
+    void
+    onMessageEnd(std::uint16_t type, std::shared_ptr<::google::protobuf::Message> const& m);
+
+    void
+    onMessage(std::shared_ptr<protocol::TMManifests> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMPing> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMCluster> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMEndpoints> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMTransaction> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMGetLedger> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMLedgerData> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMProposeSet> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMStatusChange> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMHaveTransactionSet> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMValidatorList> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMValidatorListCollection> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMValidation> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMGetObjectByHash> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMHaveTransactions> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMTransactions> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMSquelch> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMProofPathRequest> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMProofPathResponse> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMReplayDeltaRequest> const& m);
+    void
+    onMessage(std::shared_ptr<protocol::TMReplayDeltaResponse> const& m);
+
+private:
+    //--------------------------------------------------------------------------
+    // lockedRecentLock is passed as a reminder to callers that recentLock_
+    // must be locked.
+    void
+    addLedger(uint256 const& hash, std::scoped_lock<std::mutex> const& lockedRecentLock);
+
+    void
+    doFetchPack(std::shared_ptr<protocol::TMGetObjectByHash> const& packet);
+
+    void
+    onValidatorListMessage(
+        std::string const& messageType,
+        std::string const& manifest,
+        std::uint32_t version,
+        std::vector<ValidatorBlobInfo> const& blobs);
+
+    /**
+     * Process peer's request to send missing transactions. The request is
+     * sent in response to TMHaveTransactions.
+     * @param packet protocol message containing missing transactions' hashes.
+     */
+    void
+    doTransactions(std::shared_ptr<protocol::TMGetObjectByHash> const& packet);
+
+    void
+    checkTransaction(
+        HashRouterFlags flags,
+        bool checkSignature,
+        std::shared_ptr<STTx const> const& stx,
+        bool batch);
+
+    void
+    checkPropose(
+        bool isTrusted,
+        std::shared_ptr<protocol::TMProposeSet> const& packet,
+        RCLCxPeerPos peerPos);
+
+    void
+    checkValidation(
+        std::shared_ptr<STValidation> const& val,
+        uint256 const& key,
+        std::shared_ptr<protocol::TMValidation> const& packet);
+
+    void
+    sendLedgerBase(std::shared_ptr<Ledger const> const& ledger, protocol::TMLedgerData& ledgerData);
+
+    std::shared_ptr<Ledger const>
+    getLedger(std::shared_ptr<protocol::TMGetLedger> const& m);
+
+    std::shared_ptr<SHAMap const>
+    getTxSet(std::shared_ptr<protocol::TMGetLedger> const& m) const;
+
+    void
+    processLedgerRequest(std::shared_ptr<protocol::TMGetLedger> const& m);
+
+protected:
+    // Kept `protected` so test subclasses (see
+    // TMGetObjectByHash_test) can drive the
+    // synchronous processor and the differential-pricing helper without
+    // routing through the JobQueue or going through `friend` plumbing.
+    // Production callers reach these members only via
+    // `onMessage(TMGetObjectByHash)` → JobQueue → `processGetObjectByHash`.
+
+    /**
+     * Process a generic-query TMGetObjectByHash message.
+     *
+     * Dispatched from `onMessage(TMGetObjectByHash)` to the JobQueue
+     * (`JtLedgerReq`) so synchronous NodeStore lookups do not block the
+     * peer's I/O strand. Caps iteration at `Tuning::kHardMaxReplyNodes`
+     * regardless of hit/miss outcome and applies differential pricing
+     * via `computeGetObjectByHashFee()` after the fetch loop completes.
+     *
+     * @param m The protocol message containing requested object hashes.
+     */
+    void
+    processGetObjectByHash(std::shared_ptr<protocol::TMGetObjectByHash> const& m);
+
+    /**
+     * Compute the per-message resource charge for a TMGetObjectByHash
+     * request based on how much work was actually performed.
+     *
+     * The charge has three components on top of the base
+     * `Resource::kFeeModerateBurdenPeer`:
+     *   - per-hit lookup cost (cheap; usually served from cache)
+     *   - per-miss lookup cost (expensive node store seeks)
+     *   - request-size band surcharge (escalates abusive batch sizes)
+     *
+     * The first `Tuning::kFreeObjectsPerRequest` objects are free so
+     * that legitimate `InboundLedger::getNeededHashes()` traffic
+     * (at most 8 objects) is unaffected.
+     *
+     * @param requested Number of objects requested by the message. This
+     *                  value is used for request-size pricing and may
+     *                  exceed `Tuning::kHardMaxReplyNodes` when this
+     *                  helper is called directly, even though processing
+     *                  caps the iterations to `Tuning::kHardMaxReplyNodes`.
+     * @param found     Number of objects successfully returned in the
+     *                  reply.
+     * @return A `Resource::Charge` whose cost reflects the work performed.
+     */
+    static Resource::Charge
+    computeGetObjectByHashFee(int const requested, int const found);
+
+    /**
+     * Read-only accessor for the accumulated peer-message charge.
+     *
+     * Exposed at `protected` scope so test subclasses can verify the
+     * oversized-request rejection path (Layer 1) without invoking the
+     * full JobQueue handler. Production callers should never read this back —
+     * the value is consumed by `charge()`/`disconnect()` internally.
+     *
+     * @return The current `Resource::Charge` accumulated on `fee_`.
+     */
+    Resource::Charge
+    currentFeeCharge() const
+    {
+        return fee_.fee;
+    }
+};
+
+//------------------------------------------------------------------------------
+
+template <class Buffers>
+PeerImp::PeerImp(
+    Application& app,
+    std::unique_ptr<stream_type>&& streamPtr,
+    Buffers const& buffers,
+    std::shared_ptr<PeerFinder::Slot>&& slot,
+    http_response_type&& response,
+    Resource::Consumer usage,
+    PublicKey const& publicKey,
+    ProtocolVersion protocol,
+    id_t id,
+    OverlayImpl& overlay)
+    : Child(overlay)
+    , app_(app)
+    , id_(id)
+    , fingerprint_(getFingerprint(slot->remoteEndpoint(), publicKey, to_string(id_)))
+    , prefix_(makePrefix(fingerprint_))
+    , sink_(app_.getJournal("Peer"), prefix_)
+    , pSink_(app_.getJournal("Protocol"), prefix_)
+    , journal_(sink_)
+    , pJournal_(pSink_)
+    , streamPtr_(std::move(streamPtr))
+    , socket_(streamPtr_->next_layer().socket())
+    , stream_(*streamPtr_)
+    , strand_(boost::asio::make_strand(socket_.get_executor()))
+    , timer_(waitable_timer{socket_.get_executor()})
+    , remoteAddress_(slot->remoteEndpoint())
+    , overlay_(overlay)
+    , inbound_(false)
+    , protocol_(std::move(protocol))
+    , tracking_(Tracking::Unknown)
+    , trackingTime_(clock_type::now())
+    , publicKey_(publicKey)
+    , lastPingTime_(clock_type::now())
+    , creationTime_(clock_type::now())
+    , squelch_(app_.getJournal("Squelch"))
+    , usage_(usage)
+    , fee_{.fee = Resource::kFeeTrivialPeer}
+    , slot_(std::move(slot))
+    , response_(std::move(response))
+    , headers_(response_)
+    , compressionEnabled_(
+          peerFeatureEnabled(headers_, kFeatureCompr, "lz4", app_.config().compression)
+              ? Compressed::On
+              : Compressed::Off)
+    , txReduceRelayEnabled_(
+          peerFeatureEnabled(headers_, kFeatureTxrr, app_.config().txReduceRelayEnable))
+    , ledgerReplayEnabled_(
+          peerFeatureEnabled(headers_, kFeatureLedgerReplay, app_.config().ledgerReplay))
+    , ledgerReplayMsgHandler_(app, app.getLedgerReplayer())
+{
+    readBuffer_.commit(
+        boost::asio::buffer_copy(readBuffer_.prepare(boost::asio::buffer_size(buffers)), buffers));
+    JLOG(journal_.info())
+        << "compression enabled " << (compressionEnabled_ == Compressed::On)
+        << " vp reduce-relay base squelch enabled "
+        << peerFeatureEnabled(headers_, kFeatureVprr, app_.config().vpReduceRelayBaseSquelchEnable)
+        << " tx reduce-relay enabled " << txReduceRelayEnabled_ << " on " << remoteAddress_ << " "
+        << id_;
+}
+
+template <class FwdIt>
+void
+PeerImp::sendEndpoints(FwdIt first, FwdIt last)
+    requires(std::is_same_v<typename std::iterator_traits<FwdIt>::value_type, PeerFinder::Endpoint>)
+{
+    protocol::TMEndpoints tm;
+
+    while (first != last)
+    {
+        auto& tme2(*tm.add_endpoints_v2());
+        tme2.set_endpoint(first->address.toString());
+        tme2.set_hops(first->hops);
+        first++;
+    }
+    tm.set_version(2);
+
+    send(std::make_shared<Message>(tm, protocol::mtENDPOINTS));
+}
+
+}  // namespace xrpl

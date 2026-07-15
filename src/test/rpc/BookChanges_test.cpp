@@ -1,0 +1,132 @@
+#include <test/jtx/Env.h>
+#include <test/jtx/WSClient.h>
+#include <test/jtx/amount.h>
+#include <test/jtx/domain.h>
+#include <test/jtx/offer.h>
+#include <test/jtx/paths.h>
+#include <test/jtx/pay.h>
+#include <test/jtx/permissioned_dex.h>
+#include <test/jtx/sendmax.h>
+
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/beast/unit_test/suite.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/json/to_string.h>
+#include <xrpl/protocol/Feature.h>
+#include <xrpl/protocol/jss.h>
+
+namespace xrpl::test {
+
+class BookChanges_test : public beast::unit_test::Suite
+{
+public:
+    void
+    testConventionalLedgerInputStrings()
+    {
+        testcase("Specify well-known strings as ledger input");
+        jtx::Env env(*this);
+        json::Value params, resp;
+
+        // As per convention in XRPL, ledgers can be specified with strings
+        // "closed", "validated" or "current"
+        params["ledger"] = "validated";
+        resp = env.rpc("json", "book_changes", to_string(params));
+        BEAST_EXPECT(!resp[jss::result].isMember(jss::error));
+        BEAST_EXPECT(resp[jss::result][jss::status] == "success");
+        BEAST_EXPECT(resp[jss::result][jss::validated] == true);
+
+        params["ledger"] = "current";
+        resp = env.rpc("json", "book_changes", to_string(params));
+        BEAST_EXPECT(!resp[jss::result].isMember(jss::error));
+        BEAST_EXPECT(resp[jss::result][jss::status] == "success");
+        BEAST_EXPECT(resp[jss::result][jss::validated] == false);
+
+        params["ledger"] = "closed";
+        resp = env.rpc("json", "book_changes", to_string(params));
+        BEAST_EXPECT(!resp[jss::result].isMember(jss::error));
+        BEAST_EXPECT(resp[jss::result][jss::status] == "success");
+
+        // In the unit-test framework, requesting for "closed" ledgers appears
+        // to yield "validated" ledgers. This is not new behavior. It is also
+        // observed in the unit tests for the LedgerHeader class.
+        BEAST_EXPECT(resp[jss::result][jss::validated] == true);
+
+        // non-conventional ledger input should throw an error
+        params["ledger"] = "non_conventional_ledger_input";
+        resp = env.rpc("json", "book_changes", to_string(params));
+        BEAST_EXPECT(resp[jss::result].isMember(jss::error));
+        BEAST_EXPECT(resp[jss::result][jss::status] != "success");
+    }
+
+    void
+    testLedgerInputDefaultBehavior()
+    {
+        testcase(
+            "If ledger_hash or ledger_index is not specified, the behavior "
+            "must default to the `current` ledger");
+        jtx::Env env(*this);
+
+        // As per convention in XRPL, ledgers can be specified with strings
+        // "closed", "validated" or "current"
+        json::Value const resp = env.rpc("json", "book_changes", to_string(json::Value{}));
+        BEAST_EXPECT(!resp[jss::result].isMember(jss::error));
+        BEAST_EXPECT(resp[jss::result][jss::status] == "success");
+
+        // I dislike asserting the below statement, because its dependent on the
+        // unit-test framework BEAST_EXPECT(resp[jss::result][jss::ledger_index]
+        // == 3);
+    }
+
+    void
+    testDomainOffer()
+    {
+        testcase("Domain Offer");
+        using namespace jtx;
+
+        FeatureBitset const all{
+            jtx::testableAmendments() | featurePermissionedDomains | featureCredentials |
+            featurePermissionedDEX};
+
+        Env env(*this, all);
+        PermissionedDEX const permDex(env);
+        auto const& [gw, domainOwner, alice, bob, carol, USD, domainID, credType] = permDex;
+
+        auto wsc = makeWSClient(env.app().config());
+
+        env(offer(alice, XRP(10), USD(10)), Domain(domainID));
+        env.close();
+
+        env(pay(bob, carol, USD(10)), Path(~USD), Sendmax(XRP(10)), Domain(domainID));
+        env.close();
+
+        std::string const txHash{
+            env.tx()->getJson(JsonOptions::Values::None)[jss::hash].asString()};
+
+        json::Value const txResult = env.rpc("tx", txHash)[jss::result];
+        auto const ledgerIndex = txResult[jss::ledger_index].asInt();
+
+        json::Value jvParams;
+        jvParams[jss::ledger_index] = ledgerIndex;
+
+        auto jv = wsc->invoke("book_changes", jvParams);
+        auto jrr = jv[jss::result];
+
+        BEAST_EXPECT(jrr[jss::changes].size() == 1);
+        BEAST_EXPECT(jrr[jss::changes][0u][jss::domain].asString() == to_string(domainID));
+    }
+
+    void
+    run() override
+    {
+        testConventionalLedgerInputStrings();
+        testLedgerInputDefaultBehavior();
+
+        testDomainOffer();
+        // Note: Other aspects of the book_changes rpc are fertile grounds
+        // for unit-testing purposes. It can be included in future work
+    }
+};
+
+BEAST_DEFINE_TESTSUITE(BookChanges, rpc, xrpl);
+
+}  // namespace xrpl::test

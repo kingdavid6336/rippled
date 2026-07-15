@@ -1,31 +1,19 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2012-2017 Ripple Labs Inc.
 
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
+#include <test/jtx/Account.h>
+#include <test/jtx/Env.h>
+#include <test/jtx/amount.h>
+#include <test/jtx/pay.h>
 
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
+#include <xrpl/basics/CountedObject.h>
+#include <xrpl/beast/unit_test/suite.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/protocol/jss.h>
 
-#include <ripple/basics/CountedObject.h>
-#include <ripple/beast/unit_test.h>
-#include <ripple/protocol/SField.h>
-#include <ripple/protocol/jss.h>
-#include <test/jtx.h>
+#include <thread>
 
-namespace ripple {
+namespace xrpl {
 
-class GetCounts_test : public beast::unit_test::suite
+class GetCounts_test : public beast::unit_test::Suite
 {
     void
     testGetCounts()
@@ -33,7 +21,7 @@ class GetCounts_test : public beast::unit_test::suite
         using namespace test::jtx;
         Env env(*this);
 
-        Json::Value result;
+        json::Value result;
         {
             using namespace std::chrono_literals;
             // Add a little delay so the App's "uptime" will have a value.
@@ -44,18 +32,14 @@ class GetCounts_test : public beast::unit_test::suite
             BEAST_EXPECT(!result.isMember("Transaction"));
             BEAST_EXPECT(!result.isMember("STObject"));
             BEAST_EXPECT(!result.isMember("HashRouterEntry"));
-            BEAST_EXPECT(
-                result.isMember(jss::uptime) &&
-                !result[jss::uptime].asString().empty());
-            BEAST_EXPECT(
-                result.isMember(jss::dbKBTotal) &&
-                result[jss::dbKBTotal].asInt() > 0);
+            BEAST_EXPECT(result.isMember(jss::uptime) && !result[jss::uptime].asString().empty());
+            BEAST_EXPECT(result.isMember(jss::dbKBTotal) && result[jss::dbKBTotal].asInt() > 0);
         }
 
         // create some transactions
         env.close();
-        Account alice{"alice"};
-        Account bob{"bob"};
+        Account const alice{"alice"};
+        Account const bob{"bob"};
         env.fund(XRP(10000), alice, bob);
         env.trust(alice["USD"](1000), bob);
         for (auto i = 0; i < 20; ++i)
@@ -69,8 +53,7 @@ class GetCounts_test : public beast::unit_test::suite
             result = env.rpc("get_counts")[jss::result];
             BEAST_EXPECT(result[jss::status] == "success");
             // compare with values reported by CountedObjects
-            auto const& objectCounts =
-                CountedObjects::getInstance().getCounts(10);
+            auto const& objectCounts = CountedObjects::getInstance().getCounts(10);
             for (auto const& it : objectCounts)
             {
                 BEAST_EXPECTS(result.isMember(it.first), it.first);
@@ -86,8 +69,7 @@ class GetCounts_test : public beast::unit_test::suite
             BEAST_EXPECT(result[jss::status] == "success");
 
             // compare with values reported by CountedObjects
-            auto const& objectCounts =
-                CountedObjects::getInstance().getCounts(100);
+            auto const& objectCounts = CountedObjects::getInstance().getCounts(100);
             for (auto const& it : objectCounts)
             {
                 BEAST_EXPECTS(result.isMember(it.first), it.first);
@@ -105,9 +87,7 @@ class GetCounts_test : public beast::unit_test::suite
             env(pay(alice, bob, alice["USD"](5)));
             result = env.rpc("get_counts")[jss::result];
             // deliberately don't call close so we have open Tx
-            BEAST_EXPECT(
-                result.isMember(jss::local_txs) &&
-                result[jss::local_txs].asInt() > 0);
+            BEAST_EXPECT(result.isMember(jss::local_txs) && result[jss::local_txs].asInt() > 0);
         }
     }
 
@@ -119,6 +99,6 @@ public:
     }
 };
 
-BEAST_DEFINE_TESTSUITE(GetCounts, rpc, ripple);
+BEAST_DEFINE_TESTSUITE(GetCounts, rpc, xrpl);
 
-}  // namespace ripple
+}  // namespace xrpl

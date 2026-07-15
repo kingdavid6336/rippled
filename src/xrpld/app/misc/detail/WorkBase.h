@@ -1,0 +1,281 @@
+#pragma once
+
+#include <xrpld/app/misc/detail/Work.h>
+
+#include <xrpl/beast/utility/instrumentation.h>
+#include <xrpl/protocol/BuildInfo.h>
+
+#include <boost/asio.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/beast/core/multi_buffer.hpp>
+#include <boost/beast/http/empty_body.hpp>
+#include <boost/beast/http/read.hpp>
+#include <boost/beast/http/write.hpp>
+
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <utility>
+
+namespace xrpl::detail {
+
+template <class Impl>
+class WorkBase : public Work
+{
+protected:
+    using error_code = boost::system::error_code;
+    using endpoint_type = boost::asio::ip::tcp::endpoint;
+
+public:
+    using callback_type =
+        std::function<void(error_code const&, endpoint_type const&, response_type&&)>;
+
+protected:
+    using socket_type = boost::asio::ip::tcp::socket;
+    using resolver_type = boost::asio::ip::tcp::resolver;
+    using results_type = boost::asio::ip::tcp::resolver::results_type;
+    using request_type = boost::beast::http::request<boost::beast::http::empty_body>;
+
+    std::string host_;
+    std::string path_;
+    std::string port_;
+    callback_type cb_;
+    boost::asio::io_context& ios_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    resolver_type resolver_;
+    socket_type socket_;
+    request_type req_;
+    response_type res_;
+    boost::beast::multi_buffer readBuf_;
+    endpoint_type lastEndpoint_;
+    bool lastStatus_;
+
+private:
+    WorkBase(
+        std::string host,
+        std::string path,
+        std::string port,
+        boost::asio::io_context& ios,
+        endpoint_type lastEndpoint,
+        bool lastStatus,
+        callback_type cb);
+
+public:
+    ~WorkBase() override;
+
+    Impl&
+    impl()
+    {
+        return *static_cast<Impl*>(this);
+    }
+
+    void
+    run() override;
+
+    void
+    cancel() override;
+
+    void
+    fail(error_code const& ec);
+
+    void
+    onResolve(error_code const& ec, results_type results);
+
+    void
+    onConnect(error_code const& ec, endpoint_type const& endpoint);
+
+    void
+    onStart();
+
+    void
+    onRequest(error_code const& ec);
+
+    void
+    onResponse(error_code const& ec);
+
+private:
+    void
+    close();
+
+    friend Impl;
+};
+
+//------------------------------------------------------------------------------
+
+template <class Impl>
+WorkBase<Impl>::WorkBase(
+    std::string host,
+    std::string path,
+    std::string port,
+    boost::asio::io_context& ios,
+    endpoint_type lastEndpoint,
+    bool lastStatus,
+    callback_type cb)
+    : host_(std::move(host))
+    , path_(std::move(path))
+    , port_(std::move(port))
+    , cb_(std::move(cb))
+    , ios_(ios)
+    , strand_(boost::asio::make_strand(ios))
+    , resolver_(ios)
+    , socket_(ios)
+    , lastEndpoint_{std::move(lastEndpoint)}
+    , lastStatus_(lastStatus)
+{
+}
+
+template <class Impl>
+WorkBase<Impl>::~WorkBase()
+{
+    if (cb_)
+        cb_(make_error_code(boost::system::errc::not_a_socket), lastEndpoint_, std::move(res_));
+    close();
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::run()
+{
+    if (!strand_.running_in_this_thread())
+    {
+        return boost::asio::post(
+            ios_, boost::asio::bind_executor(strand_, [self = impl().shared_from_this()] {
+                self->run();
+            }));
+    }
+
+    resolver_.async_resolve(
+        host_,
+        port_,
+        boost::asio::bind_executor(
+            strand_,
+            [self = impl().shared_from_this()](error_code const& ec, results_type results) {
+                self->onResolve(ec, results);
+            }));
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::cancel()
+{
+    if (!strand_.running_in_this_thread())
+    {
+        return boost::asio::post(
+            ios_,
+
+            boost::asio::bind_executor(
+                strand_, [self = impl().shared_from_this()] { self->cancel(); }));
+    }
+
+    error_code ec;
+    resolver_.cancel();
+    socket_.cancel(ec);
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::fail(error_code const& ec)
+{
+    if (cb_)
+    {
+        cb_(ec, lastEndpoint_, std::move(res_));
+        cb_ = nullptr;
+    }
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::onResolve(error_code const& ec, results_type results)
+{
+    if (ec)
+        return fail(ec);
+
+    boost::asio::async_connect(
+        socket_,
+        results,
+        boost::asio::bind_executor(
+            strand_,
+            [self = impl().shared_from_this()](
+                error_code const& ec, endpoint_type const& endpoint) {
+                // Call the base-class overload explicitly: the derived Impl
+                // hides it with its own single-argument onConnect(ec).
+                self->WorkBase::onConnect(ec, endpoint);
+            }));
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::onConnect(error_code const& ec, endpoint_type const& endpoint)
+{
+    lastEndpoint_ = endpoint;
+
+    if (ec)
+        return fail(ec);
+
+    impl().onConnect(ec);
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::onStart()
+{
+    req_.method(boost::beast::http::verb::get);
+    req_.target(path_.empty() ? "/" : path_);
+    req_.version(11);
+    req_.set("Host", host_ + ":" + port_);
+    req_.set("User-Agent", BuildInfo::getFullVersionString());
+    req_.prepare_payload();
+    boost::beast::http::async_write(
+        impl().stream(),
+        req_,
+        boost::asio::bind_executor(
+            strand_, [self = impl().shared_from_this()](error_code const& ec, std::size_t) {
+                self->onRequest(ec);
+            }));
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::onRequest(error_code const& ec)
+{
+    if (ec)
+        return fail(ec);
+
+    boost::beast::http::async_read(
+        impl().stream(),
+        readBuf_,
+        res_,
+        boost::asio::bind_executor(
+            strand_, [self = impl().shared_from_this()](error_code const& ec, std::size_t) {
+                self->onResponse(ec);
+            }));
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::onResponse(error_code const& ec)
+{
+    if (ec)
+        return fail(ec);
+
+    close();
+    XRPL_ASSERT(cb_, "xrpl::detail::WorkBase::onResponse : callback is set");
+    cb_(ec, lastEndpoint_, std::move(res_));
+    cb_ = nullptr;
+}
+
+template <class Impl>
+void
+WorkBase<Impl>::close()
+{
+    if (socket_.is_open())
+    {
+        error_code ec;
+        socket_.shutdown(boost::asio::socket_base::shutdown_send, ec);
+        if (ec)
+            return;
+        socket_.close(ec);
+    }
+}
+
+}  // namespace xrpl::detail

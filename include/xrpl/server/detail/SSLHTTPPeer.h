@@ -1,0 +1,195 @@
+#pragma once
+
+#include <xrpl/basics/Log.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/server/Port.h>
+#include <xrpl/server/WSSession.h>
+#include <xrpl/server/detail/BaseHTTPPeer.h>
+#include <xrpl/server/detail/SSLWSPeer.h>
+
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl/context.hpp>
+#include <boost/asio/ssl/stream.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
+#include <boost/beast/ssl/ssl_stream.hpp>
+
+#include <memory>
+#include <utility>
+
+namespace xrpl {
+
+template <class Handler>
+class SSLHTTPPeer : public BaseHTTPPeer<Handler, SSLHTTPPeer<Handler>>,
+                    public std::enable_shared_from_this<SSLHTTPPeer<Handler>>
+{
+private:
+    friend class BaseHTTPPeer<Handler, SSLHTTPPeer>;
+    using socket_type = boost::asio::ip::tcp::socket;
+    using middle_type = boost::beast::tcp_stream;
+    using stream_type = boost::beast::ssl_stream<middle_type>;
+    using endpoint_type = boost::asio::ip::tcp::endpoint;
+    using yield_context = boost::asio::yield_context;
+    using error_code = boost::system::error_code;
+
+    std::unique_ptr<stream_type> streamPtr_;
+    stream_type& stream_;
+    socket_type& socket_;
+
+public:
+    template <class ConstBufferSequence>
+    SSLHTTPPeer(
+        Port const& port,
+        Handler& handler,
+        boost::asio::io_context& ioc,
+        beast::Journal journal,
+        endpoint_type remoteAddress,
+        ConstBufferSequence const& buffers,
+        middle_type&& stream);
+
+    void
+    run();
+
+    std::shared_ptr<WSSession>
+    websocketUpgrade() override;
+
+private:
+    void
+    doHandshake(yield_context doYield);
+
+    void
+    doRequest() override;
+
+    void
+    doClose() override;
+
+    void
+    onShutdown(error_code ec);
+};
+
+//------------------------------------------------------------------------------
+
+template <class Handler>
+template <class ConstBufferSequence>
+SSLHTTPPeer<Handler>::SSLHTTPPeer(
+    Port const& port,
+    Handler& handler,
+    boost::asio::io_context& ioc,
+    beast::Journal journal,
+    endpoint_type remoteAddress,
+    ConstBufferSequence const& buffers,
+    middle_type&& stream)
+    : BaseHTTPPeer<Handler, SSLHTTPPeer>(
+          port,
+          handler,
+          ioc.get_executor(),
+          journal,
+          remoteAddress,
+          buffers)
+    , streamPtr_(std::make_unique<stream_type>(middle_type(std::move(stream)), *port.context))
+    , stream_(*streamPtr_)
+    , socket_(stream_.next_layer().socket())
+{
+}
+
+// Called when the acceptor accepts our socket.
+template <class Handler>
+void
+SSLHTTPPeer<Handler>::run()
+{
+    if (!this->handler_.onAccept(this->session(), this->remoteAddress_))
+    {
+        util::spawn(
+            this->strand_, [self = this->shared_from_this()](yield_context) { self->doClose(); });
+        return;
+    }
+    if (!socket_.is_open())
+        return;
+    util::spawn(this->strand_, [self = this->shared_from_this()](yield_context doYield) {
+        self->doHandshake(doYield);
+    });
+}
+
+template <class Handler>
+std::shared_ptr<WSSession>
+SSLHTTPPeer<Handler>::websocketUpgrade()
+{
+    auto ws = this->ios().template emplace<SSLWSPeer<Handler>>(
+        this->port_,
+        this->handler_,
+        this->remoteAddress_,
+        std::move(this->message_),
+        std::move(this->streamPtr_),
+        this->journal_);
+    return ws;
+}
+
+template <class Handler>
+void
+SSLHTTPPeer<Handler>::doHandshake(yield_context doYield)
+{
+    boost::system::error_code ec;
+    stream_.set_verify_mode(boost::asio::ssl::verify_none);
+    this->startTimer();
+    this->readBuf_.consume(
+        stream_.async_handshake(stream_type::server, this->readBuf_.data(), doYield[ec]));
+    this->cancelTimer();
+    if (ec == boost::beast::error::timeout)
+        return this->onTimer();
+    if (ec)
+        return this->fail(ec, "handshake");
+    bool const http = this->port().protocol.count("peer") > 0 ||
+        this->port().protocol.count("wss") > 0 || this->port().protocol.count("wss2") > 0 ||
+        this->port().protocol.count("https") > 0;
+    if (http)
+    {
+        util::spawn(this->strand_, [self = this->shared_from_this()](yield_context doYield) {
+            self->doRead(doYield);
+        });
+        return;
+    }
+    // `this` will be destroyed
+}
+
+template <class Handler>
+void
+SSLHTTPPeer<Handler>::doRequest()
+{
+    ++this->requestCount_;
+    auto const what = this->handler_.onHandoff(
+        this->session(), std::move(streamPtr_), std::move(this->message_), this->remoteAddress_);
+    if (what.moved)
+        return;
+    if (what.response)
+        return this->write(what.response, what.keepAlive);
+    // legacy
+    this->handler_.onRequest(this->session());
+}
+
+template <class Handler>
+void
+SSLHTTPPeer<Handler>::doClose()
+{
+    this->startTimer();
+    stream_.async_shutdown(bind_executor(
+        this->strand_,
+        [self = this->shared_from_this()](error_code const& ec) { self->onShutdown(ec); }));
+}
+
+template <class Handler>
+void
+SSLHTTPPeer<Handler>::onShutdown(error_code ec)
+{
+    this->cancelTimer();
+
+    if (ec == boost::asio::error::operation_aborted)
+        return;
+    if (ec)
+    {
+        JLOG(this->journal_.debug()) << "on_shutdown: " << ec.message();
+    }
+
+    // Close socket now in case this->destructor is delayed
+    stream_.next_layer().close();
+}
+
+}  // namespace xrpl

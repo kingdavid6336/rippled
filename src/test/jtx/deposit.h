@@ -1,48 +1,64 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2018 Ripple Labs Inc.
-
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
-
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
-
-#ifndef RIPPLE_TEST_JTX_DEPOSIT_H_INCLUDED
-#define RIPPLE_TEST_JTX_DEPOSIT_H_INCLUDED
+#pragma once
 
 #include <test/jtx/Account.h>
-#include <test/jtx/Env.h>
 
-namespace ripple {
-namespace test {
-namespace jtx {
+#include <xrpl/basics/strHex.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/jss.h>
 
-/** Deposit preauthorize operations */
-namespace deposit {
+#include <string>
+#include <vector>
 
-/** Preauthorize for deposit.  Invoke as deposit::auth. */
-Json::Value
+/**
+ * Deposit preauthorize operations
+ */
+namespace xrpl::test::jtx::deposit {
+
+/**
+ * Preauthorize for deposit.  Invoke as deposit::auth.
+ */
+json::Value
 auth(Account const& account, Account const& auth);
 
-/** Remove preauthorization for deposit.  Invoke as deposit::unauth. */
-Json::Value
+/**
+ * Remove pre-authorization for deposit.  Invoke as deposit::unauth.
+ */
+json::Value
 unauth(Account const& account, Account const& unauth);
 
-}  // namespace deposit
+struct AuthorizeCredentials
+{
+    jtx::Account issuer;
+    std::string credType;
 
-}  // namespace jtx
+    auto
+    operator<=>(AuthorizeCredentials const&) const = default;
 
-}  // namespace test
-}  // namespace ripple
+    [[nodiscard]] json::Value
+    toJson() const
+    {
+        json::Value jv;
+        jv[jss::Issuer] = issuer.human();
+        jv[sfCredentialType.jsonName] = strHex(credType);
+        return jv;
+    }
 
-#endif
+    // "ledger_entry" uses a different naming convention
+    [[nodiscard]] json::Value
+    toLEJson() const
+    {
+        json::Value jv;
+        jv[jss::issuer] = issuer.human();
+        jv[jss::credential_type] = strHex(credType);
+        return jv;
+    }
+};
+
+json::Value
+authCredentials(jtx::Account const& account, std::vector<AuthorizeCredentials> const& auth);
+
+json::Value
+unauthCredentials(jtx::Account const& account, std::vector<AuthorizeCredentials> const& auth);
+
+}  // namespace xrpl::test::jtx::deposit

@@ -1,56 +1,100 @@
-//------------------------------------------------------------------------------
-/*
-    This file is part of rippled: https://github.com/ripple/rippled
-    Copyright (c) 2012-2017 Ripple Labs Inc.
 
-    Permission to use, copy, modify, and/or distribute this software for any
-    purpose  with  or without fee is hereby granted, provided that the above
-    copyright notice and this permission notice appear in all copies.
+#include <test/jtx/Env.h>
+#include <test/jtx/envconfig.h>
 
-    THE  SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-    WITH  REGARD  TO  THIS  SOFTWARE  INCLUDING  ALL  IMPLIED  WARRANTIES  OF
-    MERCHANTABILITY  AND  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-    ANY  SPECIAL ,  DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-    WHATSOEVER  RESULTING  FROM  LOSS  OF USE, DATA OR PROFITS, WHETHER IN AN
-    ACTION  OF  CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-*/
-//==============================================================================
+#include <xrpld/core/Config.h>
 
-#include <ripple/app/misc/AmendmentTable.h>
-#include <ripple/protocol/Feature.h>
-#include <ripple/protocol/jss.h>
-#include <test/jtx.h>
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/beast/unit_test/suite.h>
+#include <xrpl/config/Constants.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/json/to_string.h>
+#include <xrpl/ledger/AmendmentTable.h>
+#include <xrpl/ledger/View.h>
+#include <xrpl/protocol/Feature.h>
+#include <xrpl/protocol/digest.h>
+#include <xrpl/protocol/jss.h>
 
-namespace ripple {
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
+#include <map>
+#include <memory>
 
-class Feature_test : public beast::unit_test::suite
+namespace xrpl {
+
+class Feature_test : public beast::unit_test::Suite
 {
     void
     testInternals()
     {
         testcase("internals");
 
-        std::map<std::string, DefaultVote> const& supported =
-            ripple::detail::supportedAmendments();
+        auto const& supportedAmendments = xrpl::detail::supportedAmendments();
+        auto const& allAmendments = xrpl::allAmendments();
+
         BEAST_EXPECT(
-            supported.size() ==
-            ripple::detail::numDownVotedAmendments() +
-                ripple::detail::numUpVotedAmendments());
-        std::size_t up = 0, down = 0;
-        for (std::pair<std::string const, DefaultVote> const& amendment :
-             supported)
+            supportedAmendments.size() ==
+            xrpl::detail::numDownVotedAmendments() + xrpl::detail::numUpVotedAmendments());
         {
-            if (amendment.second == DefaultVote::no)
-                ++down;
-            else
+            std::size_t up = 0, down = 0, obsolete = 0;
+            for (auto const& [name, vote] : supportedAmendments)
             {
-                if (BEAST_EXPECT(amendment.second == DefaultVote::yes))
-                    ++up;
+                switch (vote)
+                {
+                    case VoteBehavior::DefaultYes:
+                        ++up;
+                        break;
+                    case VoteBehavior::DefaultNo:
+                        ++down;
+                        break;
+                    case VoteBehavior::Obsolete:
+                        ++obsolete;
+                        break;
+                    default:
+                        fail("Unknown VoteBehavior", __FILE__, __LINE__);
+                }
+
+                if (vote == VoteBehavior::Obsolete)
+                {
+                    BEAST_EXPECT(
+                        allAmendments.contains(name) &&
+                        allAmendments.at(name) == AmendmentSupport::Retired);
+                }
+                else
+                {
+                    BEAST_EXPECT(
+                        allAmendments.contains(name) &&
+                        allAmendments.at(name) == AmendmentSupport::Supported);
+                }
             }
+            BEAST_EXPECT(down + obsolete == xrpl::detail::numDownVotedAmendments());
+            BEAST_EXPECT(up == xrpl::detail::numUpVotedAmendments());
         }
-        BEAST_EXPECT(down == ripple::detail::numDownVotedAmendments());
-        BEAST_EXPECT(up == ripple::detail::numUpVotedAmendments());
+        {
+            std::size_t supported = 0, unsupported = 0, retired = 0;
+            for (auto const& [name, support] : allAmendments)
+            {
+                switch (support)
+                {
+                    case AmendmentSupport::Supported:
+                        ++supported;
+                        BEAST_EXPECT(supportedAmendments.contains(name));
+                        break;
+                    case AmendmentSupport::Unsupported:
+                        ++unsupported;
+                        break;
+                    case AmendmentSupport::Retired:
+                        ++retired;
+                        break;
+                    default:
+                        fail("Unknown AmendmentSupport", __FILE__, __LINE__);
+                }
+            }
+
+            BEAST_EXPECT(supported + retired == supportedAmendments.size());
+            BEAST_EXPECT(allAmendments.size() - unsupported == supportedAmendments.size());
+        }
     }
 
     void
@@ -61,23 +105,23 @@ class Feature_test : public beast::unit_test::suite
         // Test all the supported features. In a perfect world, this would test
         // FeatureCollections::featureNames, but that's private. Leave it that
         // way.
-        auto const supported = ripple::detail::supportedAmendments();
+        auto const supported = xrpl::detail::supportedAmendments();
 
         for (auto const& [feature, vote] : supported)
         {
             (void)vote;
             auto const registered = getRegisteredFeature(feature);
-            if (BEAST_EXPECT(registered))
+
+            if (BEAST_EXPECT(registered); registered.has_value())
             {
                 BEAST_EXPECT(featureToName(*registered) == feature);
                 BEAST_EXPECT(
-                    bitsetIndexToFeature(featureToBitsetIndex(*registered)) ==
-                    *registered);
+                    bitsetIndexToFeature(featureToBitsetIndex(*registered)) == *registered);
             }
         }
 
         // Test an arbitrary unknown feature
-        uint256 zero{0};
+        uint256 const zero{0};
         BEAST_EXPECT(featureToName(zero) == to_string(zero));
         BEAST_EXPECT(
             featureToName(zero) ==
@@ -88,13 +132,12 @@ class Feature_test : public beast::unit_test::suite
 
         // Test a random sampling of the variables. If any of these get retired
         // or removed, swap out for any other feature.
-        BEAST_EXPECT(featureToName(featureOwnerPaysFee) == "OwnerPaysFee");
-        BEAST_EXPECT(featureToName(featureFlow) == "Flow");
-        BEAST_EXPECT(featureToName(featureNegativeUNL) == "NegativeUNL");
-        BEAST_EXPECT(featureToName(fix1578) == "fix1578");
         BEAST_EXPECT(
-            featureToName(fixTakerDryOfferRemoval) ==
-            "fixTakerDryOfferRemoval");
+            featureToName(fixRemoveNFTokenAutoTrustLine) == "fixRemoveNFTokenAutoTrustLine");
+        BEAST_EXPECT(featureToName(featureBatchV1_1) == "BatchV1_1");
+        BEAST_EXPECT(featureToName(featureDID) == "DID");
+        BEAST_EXPECT(featureToName(fixIncludeKeyletFields) == "fixIncludeKeyletFields");
+        BEAST_EXPECT(featureToName(featureTokenEscrow) == "TokenEscrow");
     }
 
     void
@@ -105,8 +148,7 @@ class Feature_test : public beast::unit_test::suite
         using namespace test::jtx;
         Env env{*this};
 
-        std::map<std::string, DefaultVote> const& votes =
-            ripple::detail::supportedAmendments();
+        std::map<std::string, VoteBehavior> const& votes = xrpl::detail::supportedAmendments();
 
         auto jrr = env.rpc("feature")[jss::result];
         if (!BEAST_EXPECT(jrr.isMember(jss::features)))
@@ -117,16 +159,22 @@ class Feature_test : public beast::unit_test::suite
                 return;
             // default config - so all should be disabled, and
             // supported. Some may be vetoed.
-            bool expectVeto =
-                !(votes.at(feature[jss::name].asString()) == DefaultVote::yes);
+            bool const expectVeto =
+                (votes.at(feature[jss::name].asString()) == VoteBehavior::DefaultNo);
+            bool const expectObsolete =
+                (votes.at(feature[jss::name].asString()) == VoteBehavior::Obsolete);
             BEAST_EXPECTS(
-                !feature[jss::enabled].asBool(),
+                feature.isMember(jss::enabled) && !feature[jss::enabled].asBool(),
                 feature[jss::name].asString() + " enabled");
             BEAST_EXPECTS(
-                feature[jss::vetoed].asBool() == expectVeto,
+                feature.isMember(jss::vetoed) && feature[jss::vetoed].isBool() == !expectObsolete &&
+                    (!feature[jss::vetoed].isBool() ||
+                     feature[jss::vetoed].asBool() == expectVeto) &&
+                    (feature[jss::vetoed].isBool() ||
+                     feature[jss::vetoed].asString() == "Obsolete"),
                 feature[jss::name].asString() + " vetoed");
             BEAST_EXPECTS(
-                feature[jss::supported].asBool(),
+                feature.isMember(jss::supported) && feature[jss::supported].asBool(),
                 feature[jss::name].asString() + " supported");
         }
     }
@@ -139,24 +187,57 @@ class Feature_test : public beast::unit_test::suite
         using namespace test::jtx;
         Env env{*this};
 
-        auto jrr = env.rpc("feature", "MultiSignReserve")[jss::result];
+        std::string const name = "fixAMMOverflowOffer";
+        auto jrr = env.rpc("feature", name)[jss::result];
         BEAST_EXPECTS(jrr[jss::status] == jss::success, "status");
         jrr.removeMember(jss::status);
         BEAST_EXPECT(jrr.size() == 1);
-        BEAST_EXPECT(
-            jrr.isMember("586480873651E106F1D6339B0C4A8945BA705A777F3F4524626FF"
-                         "1FC07EFE41D"));
+        auto const expected = to_string(sha512Half(Slice(name.data(), name.size())));
+        char const sha[] = "12523DF04B553A0B1AD74F42DDB741DE8DC06A03FC089A0EF197E2A87F1D8107";
+        BEAST_EXPECT(expected == sha);
+        BEAST_EXPECT(jrr.isMember(expected));
         auto feature = *(jrr.begin());
 
-        BEAST_EXPECTS(feature[jss::name] == "MultiSignReserve", "name");
+        BEAST_EXPECTS(feature[jss::name] == name, "name");
         BEAST_EXPECTS(!feature[jss::enabled].asBool(), "enabled");
-        BEAST_EXPECTS(!feature[jss::vetoed].asBool(), "vetoed");
+        BEAST_EXPECTS(feature[jss::vetoed].isBool() && !feature[jss::vetoed].asBool(), "vetoed");
         BEAST_EXPECTS(feature[jss::supported].asBool(), "supported");
 
         // feature names are case-sensitive - expect error here
-        jrr = env.rpc("feature", "multiSignReserve")[jss::result];
+        jrr = env.rpc("feature", "fMM")[jss::result];
         BEAST_EXPECT(jrr[jss::error] == "badFeature");
         BEAST_EXPECT(jrr[jss::error_message] == "Feature unknown or invalid.");
+
+        // Test feature name size checks
+        static constexpr auto kOK63Name = [] {
+            return "123456789012345678901234567890123456789012345678901234567890123";
+        };
+        static_assert(validFeatureNameSize(kOK63Name));
+
+        static constexpr auto kBaD64Name = [] {
+            return "1234567890123456789012345678901234567890123456789012345678901234";
+        };
+        static_assert(!validFeatureNameSize(kBaD64Name));
+
+        static constexpr auto kOK31Name = [] { return "1234567890123456789012345678901"; };
+        static_assert(validFeatureNameSize(kOK31Name));
+
+        static constexpr auto kBaD32Name = [] { return "12345678901234567890123456789012"; };
+        static_assert(!validFeatureNameSize(kBaD32Name));
+
+        static constexpr auto kOK33Name = [] { return "123456789012345678901234567890123"; };
+        static_assert(validFeatureNameSize(kOK33Name));
+
+        // Test feature character set checks
+        static constexpr auto kOkName = [] { return "AMM_123"; };
+        static_assert(validFeatureName(kOkName));
+
+        // First character is Greek Capital Alpha, visually confusable with ASCII 'A'
+        static constexpr auto kBadName = [] { return "ΑMM_123"; };
+        static_assert(!validFeatureName(kBadName));
+
+        static constexpr auto kBadEmoji = [] { return "🔥"; };
+        static_assert(!validFeatureName(kBadEmoji));
     }
 
     void
@@ -167,9 +248,26 @@ class Feature_test : public beast::unit_test::suite
         using namespace test::jtx;
         Env env{*this};
 
-        auto jrr = env.rpc("feature", "AllTheThings")[jss::result];
-        BEAST_EXPECT(jrr[jss::error] == "badFeature");
-        BEAST_EXPECT(jrr[jss::error_message] == "Feature unknown or invalid.");
+        auto testInvalidParam = [&](auto const& param) {
+            json::Value params;
+            params[jss::feature] = param;
+            auto jrr = env.rpc("json", "feature", to_string(params))[jss::result];
+            BEAST_EXPECT(jrr[jss::error] == "invalidParams");
+            BEAST_EXPECT(jrr[jss::error_message] == "Invalid parameters.");
+        };
+
+        testInvalidParam(1);
+        testInvalidParam(1.1);
+        testInvalidParam(true);
+        testInvalidParam(json::Value(json::ValueType::Null));
+        testInvalidParam(json::Value(json::ValueType::Object));
+        testInvalidParam(json::Value(json::ValueType::Array));
+
+        {
+            auto jrr = env.rpc("feature", "AllTheThings")[jss::result];
+            BEAST_EXPECT(jrr[jss::error] == "badFeature");
+            BEAST_EXPECT(jrr[jss::error_message] == "Feature unknown or invalid.");
+        }
     }
 
     void
@@ -179,16 +277,64 @@ class Feature_test : public beast::unit_test::suite
 
         using namespace test::jtx;
         Env env{*this, envconfig([](std::unique_ptr<Config> cfg) {
-                    (*cfg)["port_rpc"].set("admin", "");
-                    (*cfg)["port_ws"].set("admin", "");
+                    (*cfg)[Sections::kPortRpc].set(Keys::kAdmin, "");
+                    (*cfg)[Sections::kPortWs].set(Keys::kAdmin, "");
                     return cfg;
                 })};
 
-        auto jrr = env.rpc("feature")[jss::result];
-        // The current HTTP/S ServerHandler returns an HTTP 403 error code here
-        // rather than a noPermission JSON error. The JSONRPCClient just eats
-        // that error and returns an null result.
-        BEAST_EXPECT(jrr.isNull());
+        {
+            auto result = env.rpc("feature")[jss::result];
+            BEAST_EXPECT(result.isMember(jss::features));
+            // There should be at least 50 amendments.  Don't do exact
+            // comparison to avoid maintenance as more amendments are added in
+            // the future.
+            BEAST_EXPECT(result[jss::features].size() >= 50);
+            for (auto it = result[jss::features].begin(); it != result[jss::features].end(); ++it)
+            {
+                uint256 id;
+                (void)id.parseHex(it.key().asString().c_str());
+                if (!BEAST_EXPECT((*it).isMember(jss::name)))
+                    return;
+                bool const expectEnabled = env.app().getAmendmentTable().isEnabled(id);
+                bool const expectSupported = env.app().getAmendmentTable().isSupported(id);
+                BEAST_EXPECTS(
+                    (*it).isMember(jss::enabled) && (*it)[jss::enabled].asBool() == expectEnabled,
+                    (*it)[jss::name].asString() + " enabled");
+                BEAST_EXPECTS(
+                    (*it).isMember(jss::supported) &&
+                        (*it)[jss::supported].asBool() == expectSupported,
+                    (*it)[jss::name].asString() + " supported");
+                BEAST_EXPECT(!(*it).isMember(jss::vetoed));
+                BEAST_EXPECT(!(*it).isMember(jss::majority));
+                BEAST_EXPECT(!(*it).isMember(jss::count));
+                BEAST_EXPECT(!(*it).isMember(jss::validations));
+                BEAST_EXPECT(!(*it).isMember(jss::threshold));
+            }
+        }
+
+        {
+            json::Value params;
+            // invalid feature
+            params[jss::feature] =
+                "1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCD"
+                "EF";
+            auto const result = env.rpc("json", "feature", to_string(params))[jss::result];
+            BEAST_EXPECTS(result[jss::error] == "badFeature", result.toStyledString());
+            BEAST_EXPECT(result[jss::error_message] == "Feature unknown or invalid.");
+        }
+
+        {
+            json::Value params;
+            params[jss::feature] =
+                "93E516234E35E08CA689FA33A6D38E103881F8DCB53023F728C307AA89D515"
+                "A7";
+            // invalid param
+            params[jss::vetoed] = true;
+            auto const result = env.rpc("json", "feature", to_string(params))[jss::result];
+            BEAST_EXPECTS(result[jss::error] == "noPermission", result[jss::error].asString());
+            BEAST_EXPECT(
+                result[jss::error_message] == "You don't have permission for this command.");
+        }
     }
 
     void
@@ -197,36 +343,45 @@ class Feature_test : public beast::unit_test::suite
         testcase("No Params, Some Enabled");
 
         using namespace test::jtx;
-        Env env{
-            *this, FeatureBitset(featureDepositAuth, featureDepositPreauth)};
+        Env env{*this, FeatureBitset{}};
 
-        std::map<std::string, DefaultVote> const& votes =
-            ripple::detail::supportedAmendments();
+        std::map<std::string, VoteBehavior> const& votes = xrpl::detail::supportedAmendments();
 
         auto jrr = env.rpc("feature")[jss::result];
         if (!BEAST_EXPECT(jrr.isMember(jss::features)))
             return;
-        for (auto it = jrr[jss::features].begin();
-             it != jrr[jss::features].end();
-             ++it)
+        for (auto it = jrr[jss::features].begin(); it != jrr[jss::features].end(); ++it)
         {
             uint256 id;
             (void)id.parseHex(it.key().asString().c_str());
             if (!BEAST_EXPECT((*it).isMember(jss::name)))
                 return;
-            bool expectEnabled = env.app().getAmendmentTable().isEnabled(id);
-            bool expectSupported =
-                env.app().getAmendmentTable().isSupported(id);
-            bool expectVeto =
-                !(votes.at((*it)[jss::name].asString()) == DefaultVote::yes);
+            bool const expectEnabled = env.app().getAmendmentTable().isEnabled(id);
+            bool const expectSupported = env.app().getAmendmentTable().isSupported(id);
+            bool const expectVeto =
+                (votes.at((*it)[jss::name].asString()) == VoteBehavior::DefaultNo);
+            bool const expectObsolete =
+                (votes.at((*it)[jss::name].asString()) == VoteBehavior::Obsolete);
             BEAST_EXPECTS(
-                (*it)[jss::enabled].asBool() == expectEnabled,
+                (*it).isMember(jss::enabled) && (*it)[jss::enabled].asBool() == expectEnabled,
                 (*it)[jss::name].asString() + " enabled");
+            if (expectEnabled)
+            {
+                BEAST_EXPECTS(
+                    !(*it).isMember(jss::vetoed), (*it)[jss::name].asString() + " vetoed");
+            }
+            else
+            {
+                BEAST_EXPECTS(
+                    (*it).isMember(jss::vetoed) && (*it)[jss::vetoed].isBool() == !expectObsolete &&
+                        (!(*it)[jss::vetoed].isBool() ||
+                         (*it)[jss::vetoed].asBool() == expectVeto) &&
+                        ((*it)[jss::vetoed].isBool() ||
+                         (*it)[jss::vetoed].asString() == "Obsolete"),
+                    (*it)[jss::name].asString() + " vetoed");
+            }
             BEAST_EXPECTS(
-                (*it)[jss::vetoed].asBool() == expectVeto,
-                (*it)[jss::name].asString() + " vetoed");
-            BEAST_EXPECTS(
-                (*it)[jss::supported].asBool() == expectSupported,
+                (*it).isMember(jss::supported) && (*it)[jss::supported].asBool() == expectSupported,
                 (*it)[jss::name].asString() + " supported");
         }
     }
@@ -250,20 +405,14 @@ class Feature_test : public beast::unit_test::suite
             if (!BEAST_EXPECT(feature.isMember(jss::name)))
                 return;
             BEAST_EXPECTS(
-                !feature.isMember(jss::majority),
-                feature[jss::name].asString() + " majority");
+                !feature.isMember(jss::majority), feature[jss::name].asString() + " majority");
+            BEAST_EXPECTS(!feature.isMember(jss::count), feature[jss::name].asString() + " count");
             BEAST_EXPECTS(
-                !feature.isMember(jss::count),
-                feature[jss::name].asString() + " count");
-            BEAST_EXPECTS(
-                !feature.isMember(jss::threshold),
-                feature[jss::name].asString() + " threshold");
+                !feature.isMember(jss::threshold), feature[jss::name].asString() + " threshold");
             BEAST_EXPECTS(
                 !feature.isMember(jss::validations),
                 feature[jss::name].asString() + " validations");
-            BEAST_EXPECTS(
-                !feature.isMember(jss::vote),
-                feature[jss::name].asString() + " vote");
+            BEAST_EXPECTS(!feature.isMember(jss::vote), feature[jss::name].asString() + " vote");
         }
 
         auto majorities = getMajorityAmendments(*env.closed());
@@ -279,11 +428,10 @@ class Feature_test : public beast::unit_test::suite
                 break;
         }
 
-        // There should be at least 5 amendments.  Don't do exact comparison
+        // There should be at least 2 amendments.  Don't do exact comparison
         // to avoid maintenance as more amendments are added in the future.
-        BEAST_EXPECT(majorities.size() >= 5);
-        std::map<std::string, DefaultVote> const& votes =
-            ripple::detail::supportedAmendments();
+        BEAST_EXPECT(majorities.size() >= 2);
+        std::map<std::string, VoteBehavior> const& votes = xrpl::detail::supportedAmendments();
 
         jrr = env.rpc("feature")[jss::result];
         if (!BEAST_EXPECT(jrr.isMember(jss::features)))
@@ -292,29 +440,30 @@ class Feature_test : public beast::unit_test::suite
         {
             if (!BEAST_EXPECT(feature.isMember(jss::name)))
                 return;
-            bool expectVeto =
-                !(votes.at(feature[jss::name].asString()) == DefaultVote::yes);
+            bool const expectVeto =
+                (votes.at(feature[jss::name].asString()) == VoteBehavior::DefaultNo);
+            bool const expectObsolete =
+                (votes.at(feature[jss::name].asString()) == VoteBehavior::Obsolete);
             BEAST_EXPECTS(
-                expectVeto ^ feature.isMember(jss::majority),
+                (expectVeto || expectObsolete) ^ feature.isMember(jss::majority),
                 feature[jss::name].asString() + " majority");
             BEAST_EXPECTS(
-                feature.isMember(jss::vetoed) &&
-                    feature[jss::vetoed].asBool() == expectVeto,
+                feature.isMember(jss::vetoed) && feature[jss::vetoed].isBool() == !expectObsolete &&
+                    (!feature[jss::vetoed].isBool() ||
+                     feature[jss::vetoed].asBool() == expectVeto) &&
+                    (feature[jss::vetoed].isBool() ||
+                     feature[jss::vetoed].asString() == "Obsolete"),
                 feature[jss::name].asString() + " vetoed");
+            BEAST_EXPECTS(feature.isMember(jss::count), feature[jss::name].asString() + " count");
             BEAST_EXPECTS(
-                feature.isMember(jss::count),
-                feature[jss::name].asString() + " count");
+                feature.isMember(jss::threshold), feature[jss::name].asString() + " threshold");
             BEAST_EXPECTS(
-                feature.isMember(jss::threshold),
-                feature[jss::name].asString() + " threshold");
-            BEAST_EXPECTS(
-                feature.isMember(jss::validations),
-                feature[jss::name].asString() + " validations");
-            BEAST_EXPECT(feature[jss::count] == (expectVeto ? 0 : 1));
+                feature.isMember(jss::validations), feature[jss::name].asString() + " validations");
+            BEAST_EXPECT(feature[jss::count] == ((expectVeto || expectObsolete) ? 0 : 1));
             BEAST_EXPECT(feature[jss::threshold] == 1);
             BEAST_EXPECT(feature[jss::validations] == 1);
             BEAST_EXPECTS(
-                expectVeto || feature[jss::majority] == 2540,
+                expectVeto || expectObsolete || feature[jss::majority] == 2540,
                 "Majority: " + feature[jss::majority].asString());
         }
     }
@@ -325,40 +474,104 @@ class Feature_test : public beast::unit_test::suite
         testcase("Veto");
 
         using namespace test::jtx;
-        Env env{*this, FeatureBitset(featureMultiSignReserve)};
+        Env env{*this, FeatureBitset{featurePriceOracle}};
+        static constexpr char const* kFeatureName = "fixAMMOverflowOffer";
 
-        auto jrr = env.rpc("feature", "MultiSignReserve")[jss::result];
+        auto jrr = env.rpc("feature", kFeatureName)[jss::result];
         if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
             return;
         jrr.removeMember(jss::status);
         if (!BEAST_EXPECT(jrr.size() == 1))
             return;
         auto feature = *(jrr.begin());
-        BEAST_EXPECTS(feature[jss::name] == "MultiSignReserve", "name");
-        BEAST_EXPECTS(!feature[jss::vetoed].asBool(), "vetoed");
+        BEAST_EXPECTS(feature[jss::name] == kFeatureName, "name");
+        BEAST_EXPECTS(feature[jss::vetoed].isBool() && !feature[jss::vetoed].asBool(), "vetoed");
 
-        jrr = env.rpc("feature", "MultiSignReserve", "reject")[jss::result];
+        jrr = env.rpc("feature", kFeatureName, "reject")[jss::result];
         if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
             return;
         jrr.removeMember(jss::status);
         if (!BEAST_EXPECT(jrr.size() == 1))
             return;
         feature = *(jrr.begin());
-        BEAST_EXPECTS(feature[jss::name] == "MultiSignReserve", "name");
-        BEAST_EXPECTS(feature[jss::vetoed].asBool(), "vetoed");
+        BEAST_EXPECTS(feature[jss::name] == kFeatureName, "name");
+        BEAST_EXPECTS(feature[jss::vetoed].isBool() && feature[jss::vetoed].asBool(), "vetoed");
 
-        jrr = env.rpc("feature", "MultiSignReserve", "accept")[jss::result];
+        jrr = env.rpc("feature", kFeatureName, "accept")[jss::result];
         if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
             return;
         jrr.removeMember(jss::status);
         if (!BEAST_EXPECT(jrr.size() == 1))
             return;
         feature = *(jrr.begin());
-        BEAST_EXPECTS(feature[jss::name] == "MultiSignReserve", "name");
-        BEAST_EXPECTS(!feature[jss::vetoed].asBool(), "vetoed");
+        BEAST_EXPECTS(feature[jss::name] == kFeatureName, "name");
+        BEAST_EXPECTS(feature[jss::vetoed].isBool() && !feature[jss::vetoed].asBool(), "vetoed");
 
         // anything other than accept or reject is an error
-        jrr = env.rpc("feature", "MultiSignReserve", "maybe");
+        jrr = env.rpc("feature", kFeatureName, "maybe");
+        BEAST_EXPECT(jrr[jss::error] == "invalidParams");
+        BEAST_EXPECT(jrr[jss::error_message] == "Invalid parameters.");
+    }
+
+    void
+    testObsolete()
+    {
+        testcase("Obsolete");
+
+        using namespace test::jtx;
+        Env env{*this};
+
+        auto const& supportedAmendments = xrpl::detail::supportedAmendments();
+        auto obsoleteFeature = std::ranges::find_if(supportedAmendments, [](auto const& pair) {
+            return pair.second == VoteBehavior::Obsolete;
+        });
+
+        if (obsoleteFeature == std::end(supportedAmendments))
+        {
+            pass();
+            return;
+        }
+
+        auto const featureName = obsoleteFeature->first;
+
+        auto jrr = env.rpc("feature", featureName)[jss::result];
+        if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
+            return;
+        jrr.removeMember(jss::status);
+        if (!BEAST_EXPECT(jrr.size() == 1))
+            return;
+        auto feature = *(jrr.begin());
+        BEAST_EXPECTS(feature[jss::name] == featureName, "name");
+        BEAST_EXPECTS(
+            feature[jss::vetoed].isString() && feature[jss::vetoed].asString() == "Obsolete",
+            "vetoed");
+
+        jrr = env.rpc("feature", featureName, "reject")[jss::result];
+        if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
+            return;
+        jrr.removeMember(jss::status);
+        if (!BEAST_EXPECT(jrr.size() == 1))
+            return;
+        feature = *(jrr.begin());
+        BEAST_EXPECTS(feature[jss::name] == featureName, "name");
+        BEAST_EXPECTS(
+            feature[jss::vetoed].isString() && feature[jss::vetoed].asString() == "Obsolete",
+            "vetoed");
+
+        jrr = env.rpc("feature", featureName, "accept")[jss::result];
+        if (!BEAST_EXPECTS(jrr[jss::status] == jss::success, "status"))
+            return;
+        jrr.removeMember(jss::status);
+        if (!BEAST_EXPECT(jrr.size() == 1))
+            return;
+        feature = *(jrr.begin());
+        BEAST_EXPECTS(feature[jss::name] == featureName, "name");
+        BEAST_EXPECTS(
+            feature[jss::vetoed].isString() && feature[jss::vetoed].asString() == "Obsolete",
+            "vetoed");
+
+        // anything other than accept or reject is an error
+        jrr = env.rpc("feature", featureName, "maybe");
         BEAST_EXPECT(jrr[jss::error] == "invalidParams");
         BEAST_EXPECT(jrr[jss::error_message] == "Invalid parameters.");
     }
@@ -376,9 +589,10 @@ public:
         testSomeEnabled();
         testWithMajorities();
         testVeto();
+        testObsolete();
     }
 };
 
-BEAST_DEFINE_TESTSUITE(Feature, rpc, ripple);
+BEAST_DEFINE_TESTSUITE(Feature, rpc, xrpl);
 
-}  // namespace ripple
+}  // namespace xrpl

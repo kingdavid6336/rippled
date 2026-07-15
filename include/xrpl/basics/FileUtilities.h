@@ -1,0 +1,24 @@
+#pragma once
+
+#include <boost/filesystem.hpp>
+#include <boost/system/error_code.hpp>
+
+#include <cstddef>
+#include <optional>
+#include <string>
+
+namespace xrpl {
+
+std::string
+getFileContents(
+    boost::system::error_code& ec,
+    boost::filesystem::path const& sourcePath,
+    std::optional<std::size_t> maxSize = std::nullopt);
+
+void
+writeFileContents(
+    boost::system::error_code& ec,
+    boost::filesystem::path const& destPath,
+    std::string const& contents);
+
+}  // namespace xrpl

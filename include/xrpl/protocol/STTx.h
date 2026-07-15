@@ -1,0 +1,229 @@
+#pragma once
+
+#include <xrpl/basics/Blob.h>
+#include <xrpl/basics/CountedObject.h>
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/json/json_value.h>
+#include <xrpl/protocol/AccountID.h>
+#include <xrpl/protocol/PublicKey.h>
+#include <xrpl/protocol/Rules.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STBase.h>
+#include <xrpl/protocol/STObject.h>
+#include <xrpl/protocol/SecretKey.h>
+#include <xrpl/protocol/SeqProxy.h>
+#include <xrpl/protocol/Serializer.h>
+#include <xrpl/protocol/TxFormats.h>
+
+#include <boost/container/flat_set.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace xrpl {
+
+enum class TxnSql : char {
+    New = 'N',
+    Conflict = 'C',
+    Held = 'H',
+    Validated = 'V',
+    Included = 'I',
+    Unknown = 'U'
+};
+
+class STTx final : public STObject, public CountedObject<STTx>
+{
+    uint256 tid_;
+    TxType txType_;
+
+public:
+    static constexpr std::size_t kMinMultiSigners = 1;
+    static constexpr std::size_t kMaxMultiSigners = 32;
+
+    STTx() = delete;
+    STTx(STTx const& other) = default;
+    STTx&
+    operator=(STTx const& other) = delete;
+
+    explicit STTx(SerialIter& sit);
+    explicit STTx(SerialIter&& sit);
+    explicit STTx(STObject&& object);
+
+    /**
+     * Constructs a transaction.
+     *
+     * The returned transaction will have the specified type and
+     * any fields that the callback function adds to the object
+     * that's passed in.
+     */
+    STTx(TxType type, std::function<void(STObject&)> assembler);
+
+    // STObject functions.
+    [[nodiscard]] SerializedTypeID
+    getSType() const override;
+
+    [[nodiscard]] std::string
+    getFullText() const override;
+
+    // Outer transaction functions / signature functions.
+    static Blob
+    getSignature(STObject const& sigObject);
+
+    [[nodiscard]] Blob
+    getSignature() const
+    {
+        return getSignature(*this);
+    }
+
+    [[nodiscard]] uint256
+    getSigningHash() const;
+
+    [[nodiscard]] TxType
+    getTxnType() const;
+
+    [[nodiscard]] Blob
+    getSigningPubKey() const;
+
+    [[nodiscard]] SeqProxy
+    getSeqProxy() const;
+
+    /**
+     * Returns the first non-zero value of (Sequence, TicketSequence).
+     */
+    [[nodiscard]] std::uint32_t
+    getSeqValue() const;
+
+    [[nodiscard]] boost::container::flat_set<AccountID>
+    getMentionedAccounts() const;
+
+    [[nodiscard]] uint256
+    getTransactionID() const;
+
+    [[nodiscard]] json::Value
+    getJson(JsonOptions options) const override;
+
+    [[nodiscard]] json::Value
+    getJson(JsonOptions options, bool binary) const;
+
+    void
+    sign(
+        PublicKey const& publicKey,
+        SecretKey const& secretKey,
+        std::optional<std::reference_wrapper<SField const>> signatureTarget = {});
+
+    /**
+     * Check the signature.
+     * @param rules The current ledger rules.
+     * @return `true` if valid signature. If invalid, the error message string.
+     */
+    [[nodiscard]] std::expected<void, std::string>
+    checkSign(Rules const& rules) const;
+
+    [[nodiscard]] std::expected<void, std::string>
+    checkBatchSign(Rules const& rules) const;
+
+    // SQL Functions with metadata.
+    static std::string const&
+    getMetaSQLInsertReplaceHeader();
+
+    [[nodiscard]] std::string
+    getMetaSQL(std::uint32_t inLedger, std::string const& escapedMetaData) const;
+
+    [[nodiscard]] std::string
+    getMetaSQL(
+        Serializer rawTxn,
+        std::uint32_t inLedger,
+        TxnSql status,
+        std::string const& escapedMetaData) const;
+
+    [[nodiscard]] std::vector<uint256> const&
+    getBatchTransactionIDs() const;
+
+    [[nodiscard]] AccountID
+    getFeePayerID() const;
+
+private:
+    /**
+     * Check the signature.
+     * @param rules The current ledger rules.
+     * @param sigObject Reference to object that contains the signature fields.
+     *     Will be *this more often than not.
+     * @return `true` if valid signature. If invalid, the error message string.
+     */
+    [[nodiscard]] std::expected<void, std::string>
+    checkSign(Rules const& rules, STObject const& sigObject) const;
+
+    [[nodiscard]] std::expected<void, std::string>
+    checkSingleSign(STObject const& sigObject) const;
+
+    [[nodiscard]] std::expected<void, std::string>
+    checkMultiSign(Rules const& rules, STObject const& sigObject) const;
+
+    [[nodiscard]] std::expected<void, std::string>
+    checkBatchSingleSign(STObject const& batchSigner) const;
+
+    [[nodiscard]] std::expected<void, std::string>
+    checkBatchMultiSign(STObject const& batchSigner, Rules const& rules) const;
+
+    void
+    buildBatchTxnIds();
+
+    STBase*
+    copy(std::size_t n, void* buf) const override;
+    STBase*
+    move(std::size_t n, void* buf) override;
+
+    friend class detail::STVar;
+    std::optional<std::vector<uint256>> batchTxnIds_;
+};
+
+bool
+passesLocalChecks(STObject const& st, std::string&);
+
+/**
+ * Sterilize a transaction.
+ *
+ * The transaction is serialized and then deserialized,
+ * ensuring that all equivalent transactions are in canonical
+ * form. This also ensures that program metadata such as
+ * the transaction's digest, are all computed.
+ */
+std::shared_ptr<STTx const>
+sterilize(STTx const& stx);
+
+/**
+ * Check whether a transaction is a pseudo-transaction
+ */
+bool
+isPseudoTx(STObject const& tx);
+
+inline STTx::STTx(SerialIter&& sit)  // NOLINT(cppcoreguidelines-rvalue-reference-param-not-moved)
+    : STTx(sit)
+{
+}
+
+inline TxType
+STTx::getTxnType() const
+{
+    return txType_;
+}
+
+inline Blob
+STTx::getSigningPubKey() const
+{
+    return getFieldVL(sfSigningPubKey);
+}
+
+inline uint256
+STTx::getTransactionID() const
+{
+    return tid_;
+}
+
+}  // namespace xrpl
